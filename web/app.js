@@ -236,12 +236,25 @@ async function ensureDeputyData(silencieux = false) {
   return true;
 }
 
+// Le panneau des groupes peut deborder de #form-grid (grille bornee par le
+// flex parent, cf. style.css) : plutot que de laisser sa propre scrollbar
+// interne s'activer sur un petit rectangle, on agrandit la fenetre pile de
+// ce qu'il faut. Sans effet si tout tient deja (overflow <= 0).
+function growToFit() {
+  const grid = $("form-grid");
+  const overflow = grid.scrollHeight - grid.clientHeight;
+  if (overflow > 0) {
+    window.pywebview.api.grow_window(overflow + 4);   // marge de securite
+  }
+}
+
 async function loadDeputies() {
   if (!(await ensureDeputyData())) return;
   $("deputy-groups").hidden = false;
   $("deputy-groups").open = true;   // visible d'emblee : on montre ce qui va
                                      // etre ajoute avant de l'ajouter
   syncDeputies();
+  growToFit();
   log(`${deputies.length} députés disponibles — coche/décoche un groupe pour ` +
     `filtrer la liste`, "line-muted");
 }
@@ -313,6 +326,15 @@ function wire() {
   $("btn-dry").addEventListener("click", dryRun);
   $("btn-send").addEventListener("click", send);
   $("btn-log-clear").addEventListener("click", () => { $("log").innerHTML = ""; });
+
+  // Repli du "toggle" natif : couvre aussi le cas ou le panneau est
+  // referme puis rouvert a la main (clic sur son <summary>), pas seulement
+  // le premier chargement gere directement dans loadDeputies().
+  $("deputy-groups").addEventListener("toggle", () => {
+    if ($("deputy-groups").open) growToFit();
+  });
+
+  $("body-text").placeholder = BODY_PLACEHOLDER;
 }
 
 // Echelle de tailles pour les boutons A-/A+ (13px = taille par defaut de
@@ -324,6 +346,15 @@ const DEFAULT_FONT_SIZE = "13px";
 
 const FONT_FAMILIES = ["Arial", "Georgia", "Times New Roman", "Courier New",
   "Verdana", "Tahoma", "Trebuchet MS"];
+
+// Exemple concret plutot qu'une description abstraite des placeholders :
+// on montre a quoi ressemble un vrai message. Le saut de ligne passe tel
+// quel dans l'attribut HTML placeholder (textarea) et dans data-placeholder
+// (Quill, dont le CSS de base heritee white-space:pre-wrap depuis
+// .ql-editor jusqu'a son ::before) : les deux le rendent comme un retour
+// a la ligne, pas besoin de <br> ni de regle CSS supplementaire.
+const BODY_PLACEHOLDER =
+  "Bonjour {{TITLE}} {{LAST}},\nEn tant qu'adhérent{{TERM}}...";
 
 function stepFontSize(delta) {
   const range = quill.getSelection(true);
@@ -358,6 +389,7 @@ function initEditor() {
 
   quill = new Quill("#editor", {
     theme: "snow",
+    placeholder: BODY_PLACEHOLDER,
     modules: {
       toolbar: [
         [{ header: [1, 2, 3, false] }],

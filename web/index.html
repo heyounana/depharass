@@ -38,15 +38,20 @@
     <label for="subject">Objet</label>
     <input id="subject" type="text" autocomplete="off">
 
-    <label>Corps</label>
+    <label>
+      Corps
+      <span class="help-icon" tabindex="0"
+            aria-label="Aide sur les variables de personnalisation"
+            data-tooltip="{{FIRST}} / {{LAST}} — prénom et nom, déduits de l'adresse
+{{TITLE}} — « M. » ou « Mme. » selon le genre
+{{TERM}} — accord grammatical, ex. « inscrit{{TERM}} »
+
+{{TITLE}} et {{TERM}} nécessitent un genre connu : un député, ou une lettre H/M/F ajoutée sur la ligne dans Destinataires.">💡</span>
+    </label>
     <div id="body-wrap">
       <div class="row tabs">
         <button type="button" class="tab is-active" data-mode="text">Texte</button>
         <button type="button" class="tab" data-mode="html">HTML</button>
-        <span class="hint">
-          <code>{{FIRST}}</code> <code>{{LAST}}</code> <code>{{TITLE}}</code>
-          (M./Mme.) <code>{{TERM}}</code> (accord : inscrit<code>{{TERM}}</code>)
-        </span>
       </div>
 
       <textarea id="body-text"></textarea>

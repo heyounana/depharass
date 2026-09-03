@@ -254,6 +254,24 @@ class Api:
             "total": len(deputes),
         }
 
+    def grow_window(self, extra):
+        """Agrandit la fenetre de `extra` pixels de hauteur, jamais ne la
+        retrecit. Appelee par la page quand un panneau deplie (ex. la liste
+        des groupes a l'Assemblee) deborde de #form-grid : mieux vaut une
+        fenetre plus grande qu'une scrollbar imbriquee dans un petit
+        rectangle. Pas d'effet si la fenetre n'a pas encore ete creee ou si
+        `extra` n'a rien a corriger."""
+        if self.window is None:
+            return
+        try:
+            extra = int(extra)
+        except (TypeError, ValueError):
+            return
+        if extra <= 0:
+            return
+        largeur, hauteur = self.window.width, self.window.height
+        self.window.resize(largeur, hauteur + extra)
+
     def dry_run(self, p):
         """Simule : resout le serveur, verifie reellement l'authentification
         (connexion + login, sans envoyer aucun mail — la session est fermee

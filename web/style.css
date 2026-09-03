@@ -86,6 +86,88 @@ main {
   color: #374151;
 }
 
+/* Icone d'aide (bulbe) a cote du label "Corps".
+
+   Infobulle maison plutot que l'attribut title natif : celui-ci n'apparait
+   qu'apres un delai systeme (~1s, non configurable) et son apparence est
+   celle de l'OS, impossible a accorder au reste de la page. Ici tout est en
+   CSS pur (deux pseudo-elements : la bulle et sa fleche), declenche au
+   survol et au focus clavier, sans JS. */
+.help-icon {
+  position: relative;
+  margin-left: 4px;
+  font-weight: normal;
+  font-size: 13px;
+  cursor: help;
+}
+
+.help-icon::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  z-index: 30;
+  top: 100%;
+  left: -6px;
+  margin-top: 9px;
+  width: 330px;
+  padding: 10px 13px;
+  border-radius: 8px;
+  background: #2b3038;
+  color: #f2f4f7;
+  /* Le texte du data-tooltip contient de vrais sauts de ligne : pre-line
+     les rend visibles (par defaut ils seraient reduits a des espaces). */
+  white-space: pre-line;
+  font: 400 12.5px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  box-shadow: 0 6px 20px rgba(16, 24, 40, .22);
+  pointer-events: none;   /* la bulle ne doit jamais voler le survol */
+}
+
+/* Queue de la bulle : un carre tourne a 45 deg, a moitie enfonce dans la
+   bulle, plutot qu'un triangle en bordures — celui-ci, de la meme couleur
+   et pose au meme endroit, disparaissait purement et simplement dans la
+   bulle. Le carre depasse par le haut et forme une pointe nette. */
+.help-icon::before {
+  content: "";
+  position: absolute;
+  z-index: 29;   /* sous la bulle : seule la pointe qui depasse se voit */
+  top: 100%;
+  left: 8px;
+  margin-top: 4px;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: #2b3038;
+  pointer-events: none;
+}
+
+/* Apparition immediate (aucun transition-delay) et fondu tres court : c'est
+   tout l'interet par rapport a l'infobulle native, qui attend ~1s. La
+   disparition, elle, retarde la visibility pour laisser le fondu finir. */
+.help-icon::before,
+.help-icon::after {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .11s ease, transform .11s ease, visibility 0s linear .11s;
+}
+
+.help-icon::after { transform: translateY(-3px); }
+.help-icon::before { transform: translateY(-3px) rotate(45deg); }
+
+.help-icon:hover::before,
+.help-icon:hover::after,
+.help-icon:focus::before,
+.help-icon:focus::after {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity .11s ease, transform .11s ease, visibility 0s;
+}
+
+.help-icon:hover::after,
+.help-icon:focus::after { transform: translateY(0); }
+.help-icon:hover::before,
+.help-icon:focus::before { transform: translateY(0) rotate(45deg); }
+
+.help-icon:focus { outline: 2px solid rgba(26, 115, 232, .35); border-radius: 4px; }
+
 label.inline {
   padding-top: 0;
   font-weight: 600;
