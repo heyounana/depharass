@@ -72,13 +72,6 @@ def _load_deputies():
     return out
 
 
-def _titles_overrides(brut):
-    """Titres attribues a la main dans la page : {adresse: "M"/"F"}.
-    Filtre les valeurs inattendues plutot que de faire confiance a l'entree."""
-    return {str(k).strip().lower(): v
-            for k, v in (brut or {}).items() if v in ("M", "F")}
-
-
 def _deputy_genders():
     """Table {adresse en minuscules: "M"/"F"} pour {{TITLE}}/{{TERM}}.
 
@@ -136,10 +129,21 @@ class Api:
         if not sm.ADDR_RE.match(sender):
             raise ValueError(f"adresse expeditrice invalide : {sender or '(vide)'}")
 
-        dests = [d.strip() for d in (p.get("dests") or []) if d.strip()]
-        for d in dests:
-            if not sm.ADDR_RE.match(d):
-                raise ValueError(f"adresse destinataire invalide : {d}")
+        # Chaque ligne vaut "adresse" ou "adresse,T" (T = H/M/F, casse libre).
+        # Le titre ecrit sur la ligne est la reference : il est visible et
+        # modifiable a la main dans le champ, contrairement a l'ancien etat
+        # cache cote page.
+        dests = []
+        titres_lignes = {}
+        for ligne in (p.get("dests") or []):
+            if not ligne.strip():
+                continue
+            adresse, genre = sm.split_recipient(ligne)
+            if not sm.ADDR_RE.match(adresse):
+                raise ValueError(f"adresse destinataire invalide : {adresse}")
+            dests.append(adresse)
+            if genre:
+                titres_lignes[adresse.lower()] = genre
         dests = list(dict.fromkeys(dests))  # dedoublonne en gardant l'ordre
         if not dests:
             raise ValueError("aucun destinataire")
@@ -188,10 +192,11 @@ class Api:
         lots = ([dests[i:i + batch] for i in range(0, len(dests), batch)]
                 if group else [[d] for d in dests])
 
-        # Genres du fichier des deputes, surcharges par les titres attribues
-        # a la main dans la page (panneau Titres) : c'est le choix explicite
-        # de l'utilisateur qui prime sur la donnee du CSV.
-        genres = {**_deputy_genders(), **_titles_overrides(p.get("titles"))}
+        # Un titre ecrit sur la ligne prime sur le CSV des deputes : c'est un
+        # choix explicite et visible de l'utilisateur. Le CSV reste le repli
+        # pour une adresse de depute saisie sans titre, qui garde ainsi le
+        # sien sans qu'on ait a le retaper.
+        genres = {**_deputy_genders(), **titres_lignes}
         sans_genre = 0
         if sm.has_gender_placeholders(body):
             sans_genre = sum(1 for d in dests if d.lower() not in genres)
@@ -217,10 +222,10 @@ class Api:
             texte = sm.read_text_tolerant(chemins[0])
         except OSError as e:
             return {"error": f"lecture impossible : {e}"}
-        adresses, stats = sm.scan_addresses(texte)
+        adresses, titres, stats = sm.scan_addresses(texte)
         if not adresses:
             return {"error": "aucune adresse email trouvee dans ce fichier"}
-        return {"addresses": adresses, "isJson": stats["json"],
+        return {"addresses": adresses, "titles": titres, "isJson": stats["json"],
                 "ignored": stats["ignorees"], "multi": stats["multiples"]}
 
     def load_deputy_data(self):
@@ -242,20 +247,43 @@ class Api:
             g["count"] += 1
         return {
             "groups": sorted(groupes.values(), key=lambda g: -g["count"]),
+            # genre necessaire ici : la page ecrit les lignes au format
+            # "adresse,M" / "adresse,F" dans le champ Destinataires.
             "deputies": [{"email": d["email"], "sigle": d["sigle"],
                           "genre": d["genre"]} for d in deputes],
             "total": len(deputes),
         }
 
     def dry_run(self, p):
-        """Simule : resout le serveur, construit les lots, rend le corps
-        personnalise pour le premier destinataire."""
+        """Simule : resout le serveur, verifie reellement l'authentification
+        (connexion + login, sans envoyer aucun mail — la session est fermee
+        aussitot), construit les lots, rend le corps personnalise pour le
+        premier destinataire. Un mot de passe errone est ainsi detecte avant
+        un envoi reel, pas pendant."""
         relay = _StderrRelay(lambda ligne: self._emit("log", ligne))
         ancien, sys.stderr = sys.stderr, relay
         try:
-            cfg = self._prepare(p)
-        except (ValueError, sm.SendMailError) as e:
-            return {"error": str(e)}
+            try:
+                cfg = self._prepare(p)
+            except (ValueError, sm.SendMailError) as e:
+                return {"error": str(e)}
+
+            pwd = "".join((p.get("password") or "").split())
+            if not pwd:
+                return {"error": "mot de passe manquant"}
+
+            try:
+                conn = sm.connect(cfg["host"], cfg["port"], cfg["sender"], pwd)
+            except smtplib.SMTPAuthenticationError as e:
+                return {"error": sm.auth_error_msg(cfg["host"], cfg["sender"], e)}
+            except (smtplib.SMTPException, OSError) as e:
+                return {"error": f"connexion a {cfg['host']}:{cfg['port']} echouee : {e}"}
+            except Exception as e:
+                return {"error": f"erreur inattendue a la connexion : {e!r}"}
+            try:
+                conn.quit()
+            except smtplib.SMTPException:
+                pass
         finally:
             sys.stderr = ancien
 
@@ -363,10 +391,30 @@ def main():
     if not index.is_file():
         sys.exit(f"page introuvable : {index}")
 
+    # Hauteur d'ouverture = hauteur minimale : pas de grand vide sous
+    # "Options avancees" au demarrage. 720px mesure comme le seuil reel a
+    # partir duquel #form-grid tient sans son propre scroll interne (marge
+    # de securite incluse) ; l'utilisateur agrandit s'il veut plus de place.
     api = Api()
-    api.window = webview.create_window(
+    window = webview.create_window(
         "Envoi de mail", str(index), js_api=api,
-        width=1060, height=1080, min_size=(820, 740))
+        width=1060, height=720, min_size=(820, 720))
+
+    # Sous Windows (backend WebView2/WinForms), exposer tout de suite la
+    # reference a la fenetre sur l'objet js_api declenche un bug connu de
+    # pywebview : sa passe d'introspection de l'objet js_api parcourt
+    # recursivement window.native, dont le graphe d'objets .NET est cyclique
+    # par nature (AccessibilityObject.Owner, SyncRoot, FontFamily.
+    # GenericSansSerif se referencent eux-memes), ce qui declenche un
+    # RecursionError en boucle et inonde la console de lignes
+    # "[pywebview] Error while processing window.native....." (inoffensif
+    # pour la fenetre elle-meme, mais tres bruyant, cf.
+    # github.com/r0x0r/pywebview/issues/1815). Le contournement confirme est
+    # de ne renseigner l'attribut qu'apres le chargement de la page, une
+    # fois cette passe d'introspection initiale deja terminee — aucune
+    # methode de Api n'utilise self.window avant un clic utilisateur, donc
+    # rien ne peut l'appeler avant que "loaded" se soit declenche.
+    window.events.loaded += lambda: setattr(api, "window", window)
 
     try:
         # La page est chargee en file:// : aucun socket ouvert, donc pas de

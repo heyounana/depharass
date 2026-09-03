@@ -40,7 +40,19 @@ from pathlib import Path
 
 import html2text
 
-ADDR_RE = re.compile(r"^[^@\s]+@([^@\s]+\.[^@\s]+)$")
+# Validation stricte d'une adresse saisie telle quelle (De, une ligne de
+# Destinataires) : uniquement les caracteres effectivement valides dans une
+# adresse email courante — pas "tout sauf @ et espace", qui laissait passer
+# "jean,paul@x.com" ou "<script>@x.com". Meme famille de caracteres que
+# EMAIL_RE plus bas, mais ancree sur toute la chaine (ici on valide un champ
+# complet, EMAIL_RE cherche une adresse au milieu d'autre chose), et chaque
+# etiquette de domaine doit commencer/finir par un alphanumerique — un tiret
+# en tete/queue n'est pas une etiquette DNS valide ("-x.com", "x-.com").
+_DOMAIN_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+ADDR_RE = re.compile(
+    rf"^[A-Za-z0-9_%+-][A-Za-z0-9._%+-]*"
+    rf"@(?:{_DOMAIN_LABEL}\.)+[A-Za-z]{{2,}}$"
+)
 
 
 class SendMailError(Exception):
@@ -98,7 +110,7 @@ def auth_error_msg(host, sender, e):
     return (
         f"authentification refusee par {host} pour {sender} : {detail}\n"
         f"  -> verifie : mot de passe d'application (pas le mot de passe du "
-        f"compte), sans espace residuel, genere pour CE compte precis, "
+        f"compte), genere pour CE compte precis, "
         f"validation en 2 etapes active. Si le compte a la Protection avancee "
         f"activee, les mots de passe d'application sont bloques par conception "
         f"(passer par OAuth2/API dans ce cas)."
@@ -151,6 +163,46 @@ EMAIL_RE = re.compile(
     r"[A-Za-z0-9_%+-][A-Za-z0-9._%+-]*"
     r"@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
 )
+
+# Titre par ligne, mode CSV uniquement (pas de sens sur du JSON). Un champ
+# valant exactement M, H ou F (H = homme, accepte comme synonyme de M),
+# borne par des separateurs virgule/point-virgule ou le debut/fin de ligne —
+# jamais une lettre isolee ailleurs dans le texte, pour eviter les faux
+# positifs (une initiale, un gabarit "M"/"L"/"XL"...). Guillemets et espaces
+# autour du champ tolerees.
+TITLE_RE = re.compile(r'(?:^|[,;])\s*"?([MHFmhf])"?\s*(?=[,;]|$)')
+
+# Lettre saisie -> genre interne. H (homme) est un synonyme de M ; la casse
+# est libre partout ou un titre est accepte.
+TITRE_LETTRES = {"M": "M", "H": "M", "F": "F"}
+
+
+def _detect_title(ligne):
+    m = TITLE_RE.search(ligne)
+    if not m:
+        return None
+    return TITRE_LETTRES[m.group(1).upper()]
+
+
+def split_recipient(ligne):
+    """Decoupe une ligne du champ Destinataires : "adresse" ou "adresse,T",
+    ou T vaut H, M ou F (casse libre, espaces toleres autour).
+
+    Renvoie (adresse, "M"/"F"/None). L'adresse n'est pas validee ici, c'est
+    le role d'ADDR_RE chez l'appelant. Une lettre presente mais inconnue
+    leve une erreur plutot que d'etre ignoree : une faute de frappe doit se
+    voir, sinon le mail partirait sans titre sans que personne le remarque."""
+    adresse, separateur, reste = ligne.partition(",")
+    adresse = adresse.strip()
+    if not separateur:
+        return adresse, None
+    lettre = reste.strip()
+    genre = TITRE_LETTRES.get(lettre.upper())
+    if genre is None:
+        raise SendMailError(
+            f"titre inconnu apres la virgule : {lettre!r} (attendu H, M ou F) "
+            f"— ligne : {ligne.strip()!r}")
+    return adresse, genre
 
 
 def read_text_tolerant(path):
@@ -205,32 +257,37 @@ def _scan_json(text):
 
 
 def scan_addresses(text):
-    """Extrait les adresses d'un texte.
+    """Extrait les adresses d'un texte, avec titre eventuel par ligne.
 
     Deux modes, choisis en sniffant le contenu (pas l'extension du fichier,
     pour rester correct meme si un JSON est renomme en .txt) :
 
     - JSON valide (le texte commence par '{' ou '[') : parcours recursif de
       toutes les valeurs chaine, voir _scan_json(). Robuste face a un export
-      minifie sur une seule ligne, ce que le mode ligne ne serait pas.
+      minifie sur une seule ligne, ce que le mode ligne ne serait pas. Pas de
+      detection de titre ici (pas de notion de "champ CSV" dans du JSON).
     - Sinon, mode ligne : une adresse par ligne, mais la ligne peut contenir
       n'importe quoi d'autre (colonnes CSV, nom, telephone). Seule la
       PREMIERE adresse de chaque ligne est retenue : un export avec une
       colonne 'email_manager' ne doit pas ajouter de destinataire a l'insu
       de l'utilisateur. Les lignes sans adresse (en-tetes CSV, separateurs,
       commentaires) sont ignorees au lieu d'etre fatales — c'est ce qui
-      permet d'avaler un CSV brut.
+      permet d'avaler un CSV brut. Si la meme ligne porte un champ M/H/F
+      (voir _detect_title), il est associe a l'adresse trouvee.
 
-    Renvoie (adresses, stats) ; stats sert a expliquer ce qui a ete ecarte
-    (vide en mode JSON, ce decompte par ligne n'y a pas de sens).
+    Renvoie (adresses, titres, stats) : titres est {adresse en minuscules:
+    "M"/"F"} pour les seules lignes ou un titre a ete detecte ; stats sert a
+    expliquer ce qui a ete ecarte (vide en mode JSON, ce decompte par ligne
+    n'y a pas de sens).
     """
     if text.lstrip()[:1] in ("{", "["):
         trouvees = _scan_json(text)
         if trouvees is not None:
-            return trouvees, {"ignorees": 0, "multiples": 0, "json": True}
+            return trouvees, {}, {"ignorees": 0, "multiples": 0, "json": True}
         # ressemblait a du JSON mais invalide (tronque, corrompu) -> repli
 
     adresses = []
+    titres = {}
     ignorees = 0
     multiples = 0
     for ligne in text.splitlines():
@@ -243,13 +300,17 @@ def scan_addresses(text):
             continue
         if len(trouvees) > 1:
             multiples += 1
-        adresses.append(trouvees[0])
-    return adresses, {"ignorees": ignorees, "multiples": multiples, "json": False}
+        adresse = trouvees[0]
+        adresses.append(adresse)
+        titre = _detect_title(ligne)
+        if titre:
+            titres[adresse.lower()] = titre
+    return adresses, titres, {"ignorees": ignorees, "multiples": multiples, "json": False}
 
 
 def read_list(path):
     """Adresses d'un fichier (voir scan_addresses pour les regles)."""
-    adresses, _ = scan_addresses(read_text_tolerant(path))
+    adresses, _, _ = scan_addresses(read_text_tolerant(path))
     if not adresses:
         raise SendMailError(f"{path} : aucune adresse email trouvee")
     return adresses

@@ -11,39 +11,27 @@
 <main>
   <div class="grid" id="form-grid">
     <label for="sender">De</label>
-    <input id="sender" type="email" placeholder="moi@gmail.com" autocomplete="off">
-
-    <label for="password">Mot de passe</label>
     <div class="row">
+      <input id="sender" type="email" placeholder="moi@gmail.com" autocomplete="off">
+      <label for="password" class="inline">Mot de passe</label>
       <input id="password" type="password" placeholder="mot de passe d'application"
-             autocomplete="off">
-      <span class="hint">les espaces sont retires automatiquement</span>
+             autocomplete="off" title="les espaces sont retires automatiquement">
     </div>
 
     <label for="dests">Destinataires</label>
     <div>
-      <textarea id="dests" rows="4" placeholder="une adresse par ligne"></textarea>
-      <div class="row">
-        <button id="btn-load" type="button" class="ghost">Charger un fichier…</button>
-        <button id="btn-load-deputies" type="button" class="ghost">Charger les députés…</button>
-        <span class="hint" id="dests-count"></span>
+      <div class="dests-row">
+        <textarea id="dests" rows="4"
+                  placeholder="une adresse par ligne — titre optionnel : adresse@exemple.fr,F (H, M ou F)"></textarea>
+        <div class="dests-buttons">
+          <button id="btn-load" type="button" class="ghost">Charger un fichier…</button>
+          <button id="btn-load-deputies" type="button" class="ghost">Charger les députés…</button>
+        </div>
       </div>
+      <span class="hint" id="dests-count"></span>
       <details id="deputy-groups" hidden>
         <summary>Groupes a l'Assemblee (<span id="deputy-groups-summary"></span>)</summary>
         <div id="deputy-groups-list"></div>
-      </details>
-      <details id="titles-panel">
-        <summary>Titres (<span id="titles-count">aucun destinataire</span>)</summary>
-        <div class="row titles-toolbar">
-          <label>
-            <input id="titles-only-missing" type="checkbox" checked>
-            sans titre uniquement
-          </label>
-          <button id="btn-title-all-m" type="button" class="ghost small">Tout M.</button>
-          <button id="btn-title-all-f" type="button" class="ghost small">Tout Mme.</button>
-          <span class="hint">s'applique aux lignes affichées</span>
-        </div>
-        <div id="titles-list"></div>
       </details>
     </div>
 

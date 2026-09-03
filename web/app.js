@@ -9,7 +9,7 @@
 const $ = (id) => document.getElementById(id);
 
 let quill = null;
-let mode = "text";      // "text" | "html"
+let mode = "html";      // "text" | "html"
 let sending = false;
 
 // ---------------------------------------------------------------- journal
@@ -67,16 +67,15 @@ function collect() {
     batchSize: $("batch-size").value,
     smtpHost: $("smtp-host").value,
     smtpPort: $("smtp-port").value,
-    // Seuls les titres attribues a la main partent : Python connait deja
-    // ceux du CSV et les fusionne dessous (voir _prepare).
-    titles: Object.fromEntries(titleOverrides),
+    // Les lignes partent telles quelles ("adresse" ou "adresse,M") : c'est
+    // Python qui les decoupe (sm.split_recipient), pour ne pas dupliquer
+    // ici la regle de ce qui est un titre valide.
   };
 }
 
 function refreshCount() {
   const n = $("dests").value.split("\n").map((s) => s.trim()).filter(Boolean).length;
   $("dests-count").textContent = n ? `${n} adresse${n > 1 ? "s" : ""}` : "";
-  refreshTitles();
 }
 
 // -------------------------------------------------------------------- mode
@@ -94,14 +93,23 @@ function setMode(next) {
 
 // ----------------------------------------------------------------- actions
 
+// Adresse seule d'une ligne "adresse" ou "adresse,M", en minuscules. Sert
+// uniquement a comparer/dedoublonner cote page ; le decoupage qui fait foi
+// est celui de Python (sm.split_recipient).
+function addressOf(ligne) {
+  return ligne.split(",")[0].trim().toLowerCase();
+}
+
 // Retire les repetitions en gardant la premiere occurrence (et sa casse).
-// La comparaison est insensible a la casse : la partie domaine l'est par
-// definition, et aucun fournisseur courant ne distingue deux boites sur la
-// seule casse de la partie locale.
+// La comparaison porte sur l'ADRESSE seule, pas la ligne entiere : sinon
+// "a@x.com" et "a@x.com,M" seraient vus comme deux destinataires.
+// Insensible a la casse : le domaine l'est par definition, et aucun
+// fournisseur courant ne distingue deux boites sur la casse de la partie
+// locale.
 function dedupe(lignes) {
   const vus = new Set();
   return lignes.filter((l) => {
-    const cle = l.toLowerCase();
+    const cle = addressOf(l);
     if (vus.has(cle)) return false;
     vus.add(cle);
     return true;
@@ -121,7 +129,14 @@ async function loadRecipients() {
   const res = await window.pywebview.api.pick_recipients_file();
   if (res.error) { log(res.error, "line-err"); return; }
   if (!res.addresses.length) return;
-  appendAddresses(res.addresses);
+
+  // Le titre detecte est ecrit dans la ligne ("adresse,M") plutot que garde
+  // a part : il devient visible et modifiable a la main dans le champ.
+  const titres = res.titles || {};
+  appendAddresses(res.addresses.map((a) => {
+    const genre = titres[a.toLowerCase()];
+    return genre ? `${a},${genre}` : a;
+  }));
 
   if (res.isJson) {
     log(`${res.addresses.length} adresse(s) trouvée(s) dans ce fichier JSON ` +
@@ -140,6 +155,9 @@ async function loadRecipients() {
     log(`  ${res.multi} ligne(s) contenaient plusieurs adresses : seule la ` +
       `première de chaque ligne a été retenue`, "line-muted");
   }
+
+  log(`  ${Object.keys(titres).length} titre(s) détecté(s) sur ` +
+    `${res.addresses.length} adresse(s)`, "line-muted");
 }
 
 // Liste complete des deputes, chargee une fois (voir load_deputy_data cote
@@ -150,13 +168,7 @@ async function loadRecipients() {
 // groupe, alors que l'utilisateur ne l'a jamais confiee au mecanisme.
 let deputies = [];                    // [{email, sigle, genre}] ordre du fichier
 let deputyManaged = new Set();        // adresses (minuscules) ajoutees par les cases
-let deputyGenders = new Map();        // adresse (minuscules) -> "M"/"F", depuis le CSV
 let deputyDataLoaded = false;
-
-// Titres attribues a la main dans le panneau Titres. Ils priment sur le CSV
-// (on peut donc corriger un depute sans toucher au fichier) et survivent au
-// retrait d'une adresse du champ, pour ne pas etre perdus si elle revient.
-let titleOverrides = new Map();       // adresse (minuscules) -> "M"/"F"
 
 function selectedDeputyGroups() {
   return Array.from(document.querySelectorAll("#deputy-groups-list input:checked"))
@@ -171,16 +183,18 @@ function selectedDeputyGroups() {
 // meme si on decoche son groupe, puisqu'elle n'a jamais ete "prise en charge".
 function syncDeputies() {
   const coches = new Set(selectedDeputyGroups());
+  // Comparaisons sur l'adresse seule : une ligne peut porter un titre
+  // ("adresse,M"), la ligne entiere ne correspondrait a rien.
   const autres = $("dests").value
     .split("\n").map((l) => l.trim()).filter(Boolean)
-    .filter((l) => !deputyManaged.has(l.toLowerCase()));
+    .filter((l) => !deputyManaged.has(addressOf(l)));
 
-  const deja = new Set(autres.map((l) => l.toLowerCase()));
+  const deja = new Set(autres.map(addressOf));
   const ajoutes = deputies
     .filter((d) => coches.has(d.sigle) && !deja.has(d.email.toLowerCase()))
-    .map((d) => d.email);
+    .map((d) => (d.genre ? `${d.email},${d.genre}` : d.email));
 
-  deputyManaged = new Set(ajoutes.map((e) => e.toLowerCase()));
+  deputyManaged = new Set(ajoutes.map(addressOf));
   $("dests").value = dedupe(autres.concat(ajoutes)).join("\n");
   refreshCount();
 
@@ -203,8 +217,6 @@ async function ensureDeputyData(silencieux = false) {
   }
 
   deputies = res.deputies;
-  deputyGenders = new Map(
-    deputies.filter((d) => d.genre).map((d) => [d.email.toLowerCase(), d.genre]));
 
   const list = $("deputy-groups-list");
   list.innerHTML = "";
@@ -234,93 +246,14 @@ async function loadDeputies() {
     `filtrer la liste`, "line-muted");
 }
 
-// ------------------------------------------------------------------ titres
-
-function recipientLines() {
-  return $("dests").value.split("\n").map((l) => l.trim()).filter(Boolean);
-}
-
-// Titre effectif : ce qui a ete attribue a la main prime sur le CSV.
-function titleFor(addr) {
-  const cle = addr.toLowerCase();
-  return titleOverrides.get(cle) || deputyGenders.get(cle) || null;
-}
-
-function setTitle(addr, genre) {
-  const cle = addr.toLowerCase();
-  if (genre) titleOverrides.set(cle, genre);
-  else titleOverrides.delete(cle);   // "—" retire l'override, le CSV reprend
-}
-
-function refreshTitles() {
-  const dests = recipientLines();
-  const sans = dests.filter((d) => !titleFor(d));
-
-  $("titles-count").textContent = dests.length
-    ? `${dests.length - sans.length} avec titre · ${sans.length} sans titre`
-    : "aucun destinataire";
-
-  // Les lignes ne sont construites que si le panneau est ouvert : charger
-  // 577 deputes ne doit pas fabriquer 577 lignes pour rien.
-  const panneau = $("titles-panel");
-  const liste = $("titles-list");
-  if (!panneau.open) { liste.innerHTML = ""; return; }
-
-  const visibles = $("titles-only-missing").checked ? sans : dests;
-  liste.innerHTML = "";
-  for (const addr of visibles) {
-    const genre = titleFor(addr);
-    const ligne = document.createElement("div");
-    ligne.className = "title-row" + (genre ? "" : " is-missing");
-
-    const select = document.createElement("select");
-    for (const [val, libelle] of [["", "—"], ["M", "M."], ["F", "Mme."]]) {
-      const opt = document.createElement("option");
-      opt.value = val;
-      opt.textContent = libelle;
-      opt.selected = (genre || "") === val;
-      select.appendChild(opt);
-    }
-    select.addEventListener("change", () => {
-      setTitle(addr, select.value);
-      refreshTitles();
-    });
-
-    const texte = document.createElement("span");
-    texte.className = "addr";
-    texte.textContent = addr;
-    ligne.append(select, texte);
-
-    // D'ou vient le titre : utile pour distinguer le CSV d'un choix manuel.
-    const source = titleOverrides.has(addr.toLowerCase()) ? "manuel"
-      : (deputyGenders.has(addr.toLowerCase()) ? "fichier députés" : "");
-    if (source) {
-      const tag = document.createElement("span");
-      tag.className = "tag";
-      tag.textContent = source;
-      ligne.appendChild(tag);
-    }
-    liste.appendChild(ligne);
-  }
-}
-
-// Applique un titre a toutes les lignes actuellement affichees (donc au
-// filtre courant) : coller 20 adresses d'un meme genre = deux clics.
-function bulkTitle(genre) {
-  const dests = recipientLines();
-  const cibles = $("titles-only-missing").checked
-    ? dests.filter((d) => !titleFor(d))
-    : dests;
-  cibles.forEach((d) => setTitle(d, genre));
-  refreshTitles();
-  log(`${cibles.length} titre(s) définis sur ${genre === "M" ? "M." : "Mme."}`,
-    "line-muted");
-}
-
 async function dryRun() {
+  // dry_run verifie une vraie authentification (connexion + login, fermee
+  // aussitot) : un mot de passe est donc requis ici aussi, pas seulement
+  // pour Envoyer.
   const res = await window.pywebview.api.dry_run(collect());
   if (res.error) { log(res.error, "line-err"); return; }
-  log(`[simulation] via ${res.host}:${res.port} — ${res.isHtml ? "HTML" : "texte"}`);
+  log(`[simulation] authentification vérifiée sur ${res.host}:${res.port} — ` +
+    `${res.isHtml ? "HTML" : "texte"}`, "line-ok");
   res.lots.forEach((lot) => log(`  -> ${lot.join(", ")}`, "line-muted"));
   if (res.personalizedFor) {
     log(`  corps personnalisé pour ${res.personalizedFor}`, "line-muted");
@@ -380,16 +313,8 @@ function wire() {
   $("btn-dry").addEventListener("click", dryRun);
   $("btn-send").addEventListener("click", send);
   $("btn-log-clear").addEventListener("click", () => { $("log").innerHTML = ""; });
-
-  // Les lignes ne sont construites qu'a l'ouverture du panneau (voir
-  // refreshTitles), d'ou l'ecoute de 'toggle'.
-  $("titles-panel").addEventListener("toggle", refreshTitles);
-  $("titles-only-missing").addEventListener("change", refreshTitles);
-  $("btn-title-all-m").addEventListener("click", () => bulkTitle("M"));
-  $("btn-title-all-f").addEventListener("click", () => bulkTitle("F"));
 }
 
-function initEditor() {
 // Echelle de tailles pour les boutons A-/A+ (13px = taille par defaut de
 // Quill, cf. .ql-container dans quill.snow.css — les pas se font donc autour
 // de la vraie valeur de depart, pas d'une valeur arbitraire).
@@ -412,9 +337,11 @@ function stepFontSize(delta) {
 function initEditor() {
   if (typeof Quill === "undefined") {
     // Assets absents : le mode HTML reste inutilisable, le mode texte marche.
+    // Renvoie false pour que l'appelant demarre quand meme sur un champ
+    // exploitable plutot que sur cet ecran vide.
     $("quill-missing").hidden = false;
     $("editor").hidden = true;
-    return;
+    return false;
   }
 
   // Par defaut Quill restreint size/font a 3 classes fixes (small/large/huge,
@@ -465,19 +392,18 @@ function initEditor() {
   plus.addEventListener("click", () => stepFontSize(1));
   group.append(minus, plus);
   toolbar.insertBefore(group, toolbar.children[1] || null);
+  return true;
 }
 
-initEditor();
+const quillReady = initEditor();
 wire();
-setMode("text");
+// HTML par defaut, sauf si Quill n'a pas pu se charger : demarrer sur un
+// panneau vide serait pire que revenir au mode texte, toujours exploitable.
+setMode(quillReady ? "html" : "text");
 
 // Les appels api.* ne sont possibles qu'une fois le pont pret.
 const actions = ["btn-load", "btn-load-deputies", "btn-dry", "btn-send"];
 actions.forEach((id) => { $(id).disabled = true; });
 window.addEventListener("pywebviewready", () => {
   actions.forEach((id) => { $(id).disabled = false; });
-  // Chargement silencieux : le compteur de titres doit etre juste des le
-  // depart, y compris pour une adresse de depute tapee a la main sans etre
-  // passee par le bouton. Sans effet visible si le fichier est absent.
-  ensureDeputyData(true).then(refreshTitles);
 });
