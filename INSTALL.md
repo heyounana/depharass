@@ -14,7 +14,19 @@ voir [README.md](README.md) — aucune installation n'y est nécessaire.
 
 ## Installation et lancement — Linux / macOS
 
-Mêmes commandes sur les deux systèmes (même shell, même outillage `venv`/`pip`) ; ce qui diffère entre eux est listé juste en dessous.
+Mêmes commandes de `venv`/`pip`/lancement sur les deux systèmes ; seul le prérequis du moteur de rendu diffère, et il se règle **avant** `pip install` ci-dessous — jamais la même commande sur les deux, `apt` n'existe pas sur macOS :
+
+- **Linux** — rien n'est présent par défaut (cf. Prérequis), installer un backend GTK ou Qt :
+
+  ```bash
+  sudo apt install python3-gi gir1.2-webkit2-4.1   # backend GTK, le plus leger
+  # si indisponible/echoue au lancement, Qt en remplacement :
+  #   pip install qtpy pyqt6 PyQt6-WebEngine
+  ```
+
+- **macOS** — rien à installer ici, WKWebView est natif au système (cf. Prérequis). Deux choses à savoir avant de lancer `pip install` :
+  - Python fourni par le système (`/usr/bin/python3`) souvent absent ou trop ancien selon la version — installer plutôt la version officielle depuis [python.org](https://www.python.org/downloads/macos/) ou via Homebrew : `brew install python`.
+  - `pip install -r requirements.txt` peut prendre nettement plus de temps qu'ailleurs : pywebview installe `pyobjc` (bindings Objective-C) sur macOS, plus volumineux à récupérer/compiler — normal, pas une erreur.
 
 ```bash
 git clone https://github.com/heyounana/depharass.git
@@ -26,19 +38,6 @@ pip install -r requirements.txt
 
 python3 app.py
 ```
-
-- **Linux uniquement** — moteur de rendu à installer explicitement avant `pip install` (rien n'est présent par défaut, cf. Prérequis) :
-
-  ```bash
-  sudo apt install python3-gi gir1.2-webkit2-4.1   # backend GTK, le plus leger
-  # si indisponible/echoue au lancement, Qt en remplacement :
-  #   pip install qtpy pyqt6 PyQt6-WebEngine
-  ```
-
-- **macOS uniquement** :
-  - Python fourni par le système (`/usr/bin/python3`) souvent absent ou trop ancien selon la version — installer plutôt la version officielle depuis [python.org](https://www.python.org/downloads/macos/) ou via Homebrew : `brew install python`.
-  - WKWebView est natif au système (cf. Prérequis) : rien à installer côté moteur de rendu.
-  - `pip install -r requirements.txt` peut prendre nettement plus de temps qu'ailleurs : pywebview installe `pyobjc` (bindings Objective-C) sur macOS, plus volumineux à récupérer/compiler — normal, pas une erreur.
 
 ### Construire un exécutable autonome (optionnel)
 
