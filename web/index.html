@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>Envoi de mail</title>
+<link rel="stylesheet" href="vendor/quill.snow.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main>
+  <div class="grid" id="form-grid">
+    <label for="sender">De</label>
+    <input id="sender" type="email" placeholder="moi@gmail.com" autocomplete="off">
+
+    <label for="password">Mot de passe</label>
+    <div class="row">
+      <input id="password" type="password" placeholder="mot de passe d'application"
+             autocomplete="off">
+      <span class="hint">les espaces sont retires automatiquement</span>
+    </div>
+
+    <label for="dests">Destinataires</label>
+    <div>
+      <textarea id="dests" rows="4" placeholder="une adresse par ligne"></textarea>
+      <div class="row">
+        <button id="btn-load" type="button" class="ghost">Charger un fichier…</button>
+        <button id="btn-load-deputies" type="button" class="ghost">Charger les députés…</button>
+        <span class="hint" id="dests-count"></span>
+      </div>
+      <details id="deputy-groups" hidden>
+        <summary>Groupes a l'Assemblee (<span id="deputy-groups-summary"></span>)</summary>
+        <div id="deputy-groups-list"></div>
+      </details>
+      <details id="titles-panel">
+        <summary>Titres (<span id="titles-count">aucun destinataire</span>)</summary>
+        <div class="row titles-toolbar">
+          <label>
+            <input id="titles-only-missing" type="checkbox" checked>
+            sans titre uniquement
+          </label>
+          <button id="btn-title-all-m" type="button" class="ghost small">Tout M.</button>
+          <button id="btn-title-all-f" type="button" class="ghost small">Tout Mme.</button>
+          <span class="hint">s'applique aux lignes affichées</span>
+        </div>
+        <div id="titles-list"></div>
+      </details>
+    </div>
+
+    <label for="subject">Objet</label>
+    <input id="subject" type="text" autocomplete="off">
+
+    <label>Corps</label>
+    <div id="body-wrap">
+      <div class="row tabs">
+        <button type="button" class="tab is-active" data-mode="text">Texte</button>
+        <button type="button" class="tab" data-mode="html">HTML</button>
+        <span class="hint">
+          <code>{{FIRST}}</code> <code>{{LAST}}</code> <code>{{TITLE}}</code>
+          (M./Mme.) <code>{{TERM}}</code> (accord : inscrit<code>{{TERM}}</code>)
+        </span>
+      </div>
+
+      <textarea id="body-text"></textarea>
+
+      <div id="body-html" hidden>
+        <div id="editor"></div>
+        <p class="hint" id="quill-missing" hidden>
+          Assets Quill introuvables — lance <code>python fetch_vendor.py</code>,
+          puis relance l'application.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <details id="advanced">
+    <summary>Options avancées</summary>
+    <div class="grid advanced-grid">
+      <label for="group">Grouper</label>
+      <div class="row">
+        <input id="group" type="checkbox">
+        <span>par lots de</span>
+        <input id="batch-size" type="number" min="1" value="50" class="narrow">
+        <span class="hint">tous les destinataires d'un lot se voient en To</span>
+      </div>
+
+      <label for="smtp-host">Serveur SMTP</label>
+      <div class="row">
+        <input id="smtp-host" type="text" placeholder="détecté automatiquement">
+        <label for="smtp-port" class="inline">Port</label>
+        <input id="smtp-port" type="number" placeholder="587" class="narrow">
+      </div>
+    </div>
+  </details>
+
+  <div class="actions">
+    <button id="btn-dry" type="button" class="ghost">Simuler</button>
+    <button id="btn-send" type="button" class="primary">Envoyer</button>
+  </div>
+
+  <section id="log-panel">
+    <div class="panel-head">
+      <strong>Journal</strong>
+      <button id="btn-log-clear" type="button" class="ghost small">Vider</button>
+    </div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script src="vendor/quill.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
