@@ -32,7 +32,7 @@ python app.py
 
 ### Construire un exécutable autonome (optionnel)
 
-Pour distribuer l'app à quelqu'un sans Python installé. Valable pour Linux **et macOS** (mêmes commandes) — PyInstaller ne fait pas de cross-compilation, ce build ne produit pas de `.exe` Windows, il faut le faire depuis une machine Windows pour ça (section suivante).
+Pour distribuer l'app à quelqu'un sans Python installé. Valable pour Linux **et macOS** (mêmes commandes) — PyInstaller ne fait pas de cross-compilation, ce build ne produit pas de `.exe` Windows, il faut le faire depuis une machine Windows pour ça (section Windows plus bas), ni un exécutable macOS depuis Linux (section macOS juste en dessous).
 
 ```bash
 pip install -r requirements-build.txt
@@ -45,6 +45,29 @@ pyinstaller --onedir --windowed --name dep_harass --clean \
 - `--add-data` embarque `web/` (page + assets Quill) et `data/` (CSV des députés), qui ne sont pas du code Python.
 
 Résultat : `dist/dep_harass/`. **Distribuer le dossier entier**, pas l'exécutable seul — il dépend des fichiers à côté de lui (`_internal/`).
+
+## Installation et lancement — macOS
+
+```bash
+git clone https://github.com/heyounana/depharass.git
+cd depharass
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+python3 app.py
+```
+
+- **Python** : celui fourni par macOS (`/usr/bin/python3`) est souvent absent ou trop ancien selon la version du système — installer plutôt la version officielle depuis [python.org](https://www.python.org/downloads/macos/) ou via Homebrew : `brew install python`.
+- **WKWebView** est natif au système (cf. Prérequis) : rien à installer côté moteur de rendu.
+- `pip install -r requirements.txt` peut prendre nettement plus de temps ici que sous Linux/Windows : pywebview installe `pyobjc` (bindings Objective-C) sur macOS, plus volumineux à récupérer/compiler — c'est normal, pas une erreur.
+
+### Construire un exécutable autonome (optionnel)
+
+Même commande que Linux ci-dessus (section précédente), à lancer **sur macOS** — PyInstaller ne fait pas de cross-compilation, un build Linux ne donne pas d'exécutable macOS.
+
+Résultat : `dist/dep_harass/`. Sous macOS, un exécutable non signé/notarié déclenche Gatekeeper (« ne peut pas être ouvert car il provient d'un développeur non identifié ») au premier lancement : clic droit sur `dep_harass` → *Ouvrir*, ou dans un terminal, depuis le dossier extrait, `xattr -d com.apple.quarantine dep_harass`. Même situation que SmartScreen sous Windows (section suivante) — seule une signature de code (compte développeur Apple payant) l'évite complètement.
 
 ## Installation et lancement — Windows
 
