@@ -41,7 +41,21 @@ python3 app.py
 
 ### Construire un exécutable autonome (optionnel)
 
-Pour distribuer l'app à quelqu'un sans Python installé. Toujours les mêmes commandes sur Linux et macOS — PyInstaller ne fait pas de cross-compilation : ce build ne produit ni `.exe` Windows (section suivante), ni d'exécutable macOS depuis Linux ou l'inverse — il faut le lancer sur la plateforme cible.
+Pour distribuer l'app à quelqu'un sans Python installé. PyInstaller ne fait pas de cross-compilation : lancer la commande sur la plateforme cible (un build Linux ne donne pas d'exécutable macOS ni l'inverse ; le build Windows est en section suivante). Les commandes Linux et macOS diffèrent par un flag — voir pourquoi ci-dessous.
+
+**Linux :**
+
+```bash
+pip install -r requirements-build.txt
+pyinstaller --onefile --windowed --name dep_harass --clean \
+    --collect-all webview --add-data "web:web" --add-data "data:data" app.py
+```
+
+Résultat : `dist/dep_harass`, un seul fichier exécutable — `chmod +x dist/dep_harass` puis le distribuer tel quel, rien d'autre à garder à côté.
+
+`--onefile` plutôt que `--onedir` ici : sur Linux il n'existe pas de format d'application "bundle" comme sur macOS, donc `--onedir` produirait un dossier (exécutable + `_internal/`) à garder assemblé pour le distribuer — `--onefile` évite complètement cette contrainte. Contrepartie : l'exécutable se désarchive dans un dossier temporaire **à chaque lancement**, pas seulement au premier, donc un démarrage un peu plus lent qu'avec `--onedir`. L'argument antivirus qui justifie `--onedir` sous Windows (heuristiques associant l'auto-extraction au runtime au comportement d'un dropper) ne s'applique pas ici — Linux n'a pas d'équivalent d'antivirus grand public à contourner.
+
+**macOS :**
 
 ```bash
 pip install -r requirements-build.txt
@@ -49,11 +63,16 @@ pyinstaller --onedir --windowed --name dep_harass --clean \
     --collect-all webview --add-data "web:web" --add-data "data:data" app.py
 ```
 
-- `--onedir` plutôt que `--onefile` : démarrage quasi instantané (pas d'auto-extraction vers un dossier temporaire à chaque lancement) et nettement moins de faux positifs antivirus, ce dernier point étant justement le comportement runtime que les heuristiques associent aux droppers.
+Résultat : `dist/dep_harass.app`, un bundle applicatif standard macOS (Finder l'affiche comme une seule icône, malgré `--onedir` — `--windowed` place systématiquement le contenu, `_internal` compris, à l'intérieur du bundle plutôt qu'à côté). **Distribuer le `.app` entier.**
+
+`--onedir` plutôt que `--onefile` ici, à l'inverse de Linux : la documentation officielle de PyInstaller déconseille explicitement `--onefile --windowed` sur macOS — un bundle onefile se réextrait *et* se refait rescanner par le système à chaque lancement (pas seulement le premier), et n'est de toute façon pas compatible avec le sandboxing requis pour une distribution via le Mac App Store. Comme `--windowed` produit déjà un bundle unique avec `--onedir`, `--onefile` n'apporterait ici aucun bénéfice de distribution, seulement ces inconvénients.
+
+Sous macOS, un bundle non signé/notarié déclenche Gatekeeper (« ne peut pas être ouvert car il provient d'un développeur non identifié ») au premier lancement : clic droit sur `dep_harass.app` → *Ouvrir*, ou dans un terminal `xattr -d com.apple.quarantine dep_harass.app`. Même situation que SmartScreen sous Windows ci-dessous — seule une signature de code (compte développeur Apple payant) l'évite complètement.
+
+Commun aux deux commandes :
+
 - `--collect-all webview` : pywebview charge son backend par plateforme dynamiquement (WebView2, GTK, Qt...), invisible à l'analyse statique de PyInstaller sans ce flag.
 - `--add-data` embarque `web/` (page + assets Quill) et `data/` (CSV des députés), qui ne sont pas du code Python.
-
-Résultat : `dist/dep_harass/`. **Distribuer le dossier entier**, pas l'exécutable seul — il dépend des fichiers à côté de lui (`_internal/`). Sous macOS, un exécutable non signé/notarié déclenche Gatekeeper (« ne peut pas être ouvert car il provient d'un développeur non identifié ») au premier lancement : clic droit sur `dep_harass` → *Ouvrir*, ou dans un terminal, depuis le dossier extrait, `xattr -d com.apple.quarantine dep_harass` — même situation que SmartScreen sous Windows ci-dessous, seule une signature de code (compte développeur Apple payant) l'évite complètement.
 
 ## Installation et lancement — Windows
 
@@ -80,6 +99,19 @@ pyinstaller --onedir --windowed --name dep_harass --clean ^
     --collect-all webview --add-data "web;web" --add-data "data;data" app.py
 ```
 
-Seule différence avec la commande Linux/macOS : le séparateur de `--add-data` (`;` au lieu de `:`). Le reste des options (`--onedir`, `--collect-all webview`, etc.) répond aux mêmes raisons, détaillées dans la section Linux ci-dessus.
+Comme sous macOS (section précédente), `--onedir` plutôt que `--onefile` : démarrage quasi instantané (pas d'auto-extraction vers un dossier temporaire à chaque lancement) et nettement moins de faux positifs antivirus, ce dernier point étant justement le comportement runtime que les heuristiques Windows associent aux droppers — contrairement à Linux, cet argument s'applique pleinement ici. `--collect-all webview` et `--add-data` répondent aux mêmes raisons que sous Linux/macOS (voir ci-dessus) ; seul le séparateur de `--add-data` change (`;` au lieu de `:`).
 
 Résultat : `dist\dep_harass\`, avec `dep_harass.exe` dedans. **Distribuer le dossier entier**, pas l'exécutable seul — il dépend des fichiers à côté de lui (`_internal\`). L'exécutable n'étant pas signé, il peut déclencher un avertissement SmartScreen au premier lancement (« éditeur non reconnu ») ; c'est indépendant du build, seule une signature de code payante l'évite.
+
+## Publier une release
+
+Le fichier produit par le build (`dep_harass.exe`, le bundle `dep_harass.app`, ou le binaire `dep_harass` sous Linux — zippé/tar.gz selon la plateforme) se publie en asset d'une release GitHub, pas dans le dépôt git : `dist/` est volontairement ignoré, un binaire committé resterait dans l'historique pour toujours.
+
+```bash
+git tag v1.0
+git push origin v1.0
+gh release create v1.0 dist/dep_harass.zip --title "dep_harass v1.0"
+```
+
+Le lien de téléchargement référencé par le README suit alors le format
+`https://github.com/heyounana/depharass/releases/download/<tag>/dep_harass.zip`.
