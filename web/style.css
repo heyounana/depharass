@@ -68,7 +68,18 @@ main {
    petite pour tout tenir malgre ca, ce panneau (et lui seul) scrolle en
    interne plutot que la page entiere. */
 #form-grid {
-  grid-template-rows: auto auto auto auto minmax(120px, 1fr);
+  /* 4 valeurs pour 4 rangees reelles (De, Destinataires, Objet, Corps) : en
+     avoir eu 5 ici (bug corrige) faisait retomber la derniere rangee
+     (Corps) sur la 4e valeur, "auto" au lieu du minmax(...,1fr) vise pour
+     elle — plus aucune rangee n'etait alors flexible, et l'espace en trop
+     de la grille se dispersait dans les 4 rangees "auto" (align-content
+     par defaut = stretch) au lieu de se concentrer dans Corps.
+  */
+  grid-template-rows: auto auto auto minmax(120px, 1fr);
+  /* Complement du point ci-dessus : meme avec les rangees a jour, ne
+     jamais laisser une rangee non-flexible s'etirer pour absorber de la
+     place en trop. */
+  align-content: start;
   /* flex-basis a 0, pas "auto" : la taille vient uniquement du calcul
      flexbox (part de l'espace dispo), jamais du contenu. Une grille CSS
      avec une ligne 1fr imbriquee dans un flex parent en basis "auto" cree
@@ -387,6 +398,15 @@ details[open] summary { border-bottom: 1px solid var(--border); }
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
   gap: 4px 12px;
   padding: 10px 14px;
+  /* Boite a hauteur bornee avec sa propre scrollbar (meme principe que
+     #log plus bas) plutot que de faire grandir la fenetre pour tout
+     montrer : mesure empiriquement pour afficher tous les groupes actuels
+     sans scroll dans le cas courant (marge au-dela de leur hauteur reelle),
+     tout en bornant ce que #form-grid doit absorber (voir min_size dans
+     app.py) meme si leur nombre change (fichier different...) — sans
+     aucune coordination JS/Python. */
+  max-height: 100px;
+  overflow-y: auto;
 }
 
 #deputy-groups-list label {

@@ -254,24 +254,6 @@ class Api:
             "total": len(deputes),
         }
 
-    def grow_window(self, extra):
-        """Agrandit la fenetre de `extra` pixels de hauteur, jamais ne la
-        retrecit. Appelee par la page quand un panneau deplie (ex. la liste
-        des groupes a l'Assemblee) deborde de #form-grid : mieux vaut une
-        fenetre plus grande qu'une scrollbar imbriquee dans un petit
-        rectangle. Pas d'effet si la fenetre n'a pas encore ete creee ou si
-        `extra` n'a rien a corriger."""
-        if self.window is None:
-            return
-        try:
-            extra = int(extra)
-        except (TypeError, ValueError):
-            return
-        if extra <= 0:
-            return
-        largeur, hauteur = self.window.width, self.window.height
-        self.window.resize(largeur, hauteur + extra)
-
     def dry_run(self, p):
         """Simule : resout le serveur, verifie reellement l'authentification
         (connexion + login, sans envoyer aucun mail — la session est fermee
@@ -409,14 +391,20 @@ def main():
     if not index.is_file():
         sys.exit(f"page introuvable : {index}")
 
-    # Hauteur d'ouverture = hauteur minimale : pas de grand vide sous
-    # "Options avancees" au demarrage. 720px mesure comme le seuil reel a
-    # partir duquel #form-grid tient sans son propre scroll interne (marge
-    # de securite incluse) ; l'utilisateur agrandit s'il veut plus de place.
+    # Hauteur d'ouverture = hauteur minimale. 870px mesure comme le seuil
+    # reel a partir duquel #form-grid tient sans son propre scroll interne
+    # (marge de securite incluse) UNE FOIS le panneau "Charger les deputes"
+    # deplie — pas juste le formulaire nu (720px suffisait pour ca seul,
+    # mais laissait #form-grid trop court des que ce panneau apparait, avec
+    # #deputy-groups-list borne a 100px cote CSS). Consequence acceptee :
+    # un peu de vide sous "Options avancees" quand ce panneau n'est jamais
+    # ouvert — prefere a toute logique de redimensionnement dynamique
+    # (essayee, source de plusieurs bugs d'ordonnancement JS/Python,
+    # abandonnee au profit de cette seule valeur statique).
     api = Api()
     window = webview.create_window(
         "Envoi de mail", str(index), js_api=api,
-        width=1060, height=720, min_size=(820, 720))
+        width=1060, height=870, min_size=(820, 870))
 
     # Sous Windows (backend WebView2/WinForms), exposer tout de suite la
     # reference a la fenetre sur l'objet js_api declenche un bug connu de
