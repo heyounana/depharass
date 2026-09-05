@@ -358,7 +358,10 @@ def split_name(addr):
 def personalize(body, addr, genre=None):
     """Remplace les placeholders dans body pour le destinataire addr.
 
-    {{FIRST}}/{{LAST}} viennent de l'adresse (voir split_name).
+    {{FIRST}}/{{LAST}} viennent de l'adresse (voir split_name). {{LAST}} est
+    mis en majuscules a la substitution (convention "Prenom NOM"), pas
+    {{FIRST}} — split_name() lui-meme garde la casse d'origine, c'est un
+    choix de presentation propre a personalize().
     {{TITLE}} -> "M."/"Mme." et {{TERM}} -> ""/"e" (accord grammatical :
     "inscrit{{TERM}}") demandent `genre` valant "M" ou "F".
 
@@ -371,7 +374,7 @@ def personalize(body, addr, genre=None):
     terminaison = TERMINAISONS.get(genre, "") if genre else ""
     return (body
             .replace("{{FIRST}}", first)
-            .replace("{{LAST}}", last)
+            .replace("{{LAST}}", last.upper())
             .replace("{{TITLE}}", titre)
             .replace("{{TERM}}", terminaison))
 
