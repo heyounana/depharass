@@ -433,15 +433,32 @@ def derive_names(addr):
 
 
 def resolve_names(addr, table=None):
-    """(prenom, nom) pour addr, ou (None, None) si rien de fiable.
+    """(prenom, nom) pour addr — jamais vide.
 
-    `table` — {adresse en minuscules: (prenom, nom)} — fait autorite : c'est
-    le CSV des deputes, ou les noms sont exacts. Une adresse absente retombe
-    sur la deduction depuis l'adresse elle-meme."""
+    Trois sources, par ordre de fiabilite :
+      1. `table` — {adresse en minuscules: (prenom, nom)} — le CSV des
+         deputes, ou les noms sont exacts ;
+      2. derive_names(), quand l'adresse est un "prenom.nom" franc ;
+      3. a defaut, la partie locale entiere, servie des deux cotes :
+         "heyonono@..." donne {{FIRST}} = Heyonono et {{LAST}} = HEYONONO.
+
+    Le repli 3 n'est pas un nom, c'est un pis-aller : mieux vaut un mail qui
+    dit "Bonjour M. HEYONONO," qu'un "Bonjour  ," a trou. L'appelant sait
+    lequel des trois a servi via nom_fiable(), pour le signaler sans bloquer."""
     depuis_table = (table or {}).get(addr.lower())
     if depuis_table:
         return depuis_table
-    return derive_names(addr)
+    prenom, nom = derive_names(addr)
+    if nom:
+        return prenom, nom
+    local = addr.split("@", 1)[0]
+    return _capitaliser(local), local
+
+
+def nom_fiable(addr, table=None):
+    """Le nom vient-il du CSV ou d'un "prenom.nom" franc, plutot que du repli
+    sur la partie locale ? Sert a avertir sans empecher l'envoi."""
+    return bool((table or {}).get(addr.lower()) or derive_names(addr)[1])
 
 
 def personalize(body, addr, genre=None, names=None):
