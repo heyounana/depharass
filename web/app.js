@@ -4,7 +4,8 @@
 // personnalisation) vit cote Python dans send_mail.py : ce fichier ne fait
 // que collecter les champs, appeler window.pywebview.api.*, et afficher ce
 // qui remonte. Aucune regle metier n'est dupliquee ici — notamment la
-// derivation {{FIRST}}/{{LAST}}, qui reste dans send_mail.split_name().
+// resolution des noms {{FIRST}}/{{LAST}}, qui reste dans send_mail.py (le CSV
+// des deputes fait autorite, voir resolve_names).
 
 const $ = (id) => document.getElementById(id);
 
@@ -36,12 +37,66 @@ window.onAppEvent = function (kind, payload) {
     log(payload, "line-err");
   } else if (kind === "summary") {
     log(`${payload.ok} envoi(s) OK, ${payload.ko} echec(s)`);
+  } else if (kind === "progress") {
+    showProgress(payload);
   } else if (kind === "done") {
     sending = false;
-    $("btn-send").disabled = false;
-    $("btn-send").textContent = "Envoyer";
+    setCampaignButtons(false);
+    stopCountdown();
+    const raisons = {
+      annule: "campagne arrêtée",
+      throttle: "campagne interrompue par le serveur",
+      erreur: "campagne interrompue sur erreur",
+    };
+    const p = payload || {};
+    if (raisons[p.raison]) {
+      // "restants" n'est pas un echec : ces destinataires n'ont jamais ete
+      // tentes. Le dire, sinon un arret ressemble a une campagne terminee.
+      log(`${raisons[p.raison]} — ${p.restants || 0} destinataire(s) non contacté(s)`,
+        "line-err");
+    }
+    $("progress").hidden = true;
   }
 };
+
+// ------------------------------------------------------------- progression
+
+let countdownTimer = null;
+
+function stopCountdown() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+}
+
+// Le compte a rebours tourne ici et pas cote Python : un evenement par seconde
+// traverserait le pont pywebview 3 600 fois par heure pour rien. Python envoie
+// la duree une fois, la page la decompte.
+function showProgress(p) {
+  const el = $("progress");
+  el.hidden = false;
+  stopCountdown();
+
+  if (p.etat === "hors-plage") {
+    el.textContent = "hors plage horaire — en attente";
+    return;
+  }
+
+  const base = `${p.faits}/${p.total}` +
+    (p.ko ? ` · ${p.ko} échec${p.ko > 1 ? "s" : ""}` : "");
+  $("btn-send").textContent = `Envoi ${p.faits}/${p.total}…`;
+
+  let reste = Math.round(p.attente || 0);
+  const rendre = () => {
+    if (paused) { el.textContent = `${base} · en pause`; return; }
+    el.textContent = reste > 0 ? `${base} · prochain dans ${reste} s` : base;
+  };
+  rendre();
+  if (reste > 0) {
+    countdownTimer = setInterval(() => {
+      if (!paused && reste > 0) reste -= 1;
+      rendre();
+    }, 1000);
+  }
+}
 
 // ------------------------------------------------------------------ champs
 
@@ -61,16 +116,69 @@ function collect() {
     password: $("password").value,
     dests,
     subject: $("subject").value,
+    // Liste alimentee par le bouton "+" : vide tant qu'on n'y a pas touche,
+    // auquel cas Python retombe sur le champ Objet seul — le formulaire se
+    // comporte alors exactement comme avant.
+    subjects: subjectVariants.slice(),
     body: bodyContent(),
     isHtml: mode === "html",
     group: $("group").checked,
     batchSize: $("batch-size").value,
+    durationValue: $("duration-value").value,
+    durationUnit: $("duration-unit").value,
+    quietStart: $("quiet-start").value,
+    quietEnd: $("quiet-end").value,
     smtpHost: $("smtp-host").value,
     smtpPort: $("smtp-port").value,
     // Les lignes partent telles quelles ("adresse" ou "adresse,M") : c'est
     // Python qui les decoupe (sm.split_recipient), pour ne pas dupliquer
     // ici la regle de ce qui est un titre valide.
   };
+}
+
+// ------------------------------------------------------------------- objets
+
+// Objets alternes entre destinataires. Tant que cette liste est vide, le champ
+// Objet fonctionne comme avant ; des qu'on y ajoute quelque chose, c'est elle
+// qui fait foi et chaque message tire le sien (cote Python).
+let subjectVariants = [];
+
+function refreshSubjects() {
+  const liste = $("subject-list");
+  liste.innerHTML = "";
+  subjectVariants.forEach((texte, i) => {
+    const li = document.createElement("li");
+    li.className = "chip";
+    const label = document.createElement("span");
+    label.textContent = texte;          // jamais innerHTML : saisie utilisateur
+    const retirer = document.createElement("button");
+    retirer.type = "button";
+    retirer.className = "chip-x";
+    retirer.textContent = "×";
+    retirer.title = "Retirer cet objet";
+    retirer.addEventListener("click", () => {
+      subjectVariants.splice(i, 1);
+      refreshSubjects();
+    });
+    li.append(label, retirer);
+    liste.appendChild(li);
+  });
+  liste.hidden = !subjectVariants.length;
+  $("subject-hint").hidden = !subjectVariants.length;
+  $("subject-hint").textContent = subjectVariants.length
+    ? `${subjectVariants.length} objet${subjectVariants.length > 1 ? "s" : ""} — ` +
+      `chaque message en tire un au hasard`
+    : "";
+}
+
+function addSubject() {
+  const texte = $("subject").value.trim();
+  if (!texte) { log("objet vide", "line-err"); return; }
+  if (subjectVariants.includes(texte)) { log("objet déjà dans la liste", "line-err"); return; }
+  subjectVariants.push(texte);
+  $("subject").value = "";
+  $("subject").focus();
+  refreshSubjects();
 }
 
 function refreshCount() {
@@ -258,39 +366,103 @@ async function dryRun() {
   if (res.personalizedFor) {
     log(`  corps personnalisé pour ${res.personalizedFor}`, "line-muted");
   }
-  warnMissingGender(res.missingGender);
+  logExcluded(res.excluded);
 }
 
-// {{TITLE}}/{{TERM}} n'ont de valeur que pour un destinataire dont le genre
-// est connu (les députés du fichier). Pour les autres ils deviennent des
-// blancs : on le dit, plutôt que de laisser partir "Bonjour  Dupont".
-function warnMissingGender(n) {
-  if (!n) return;
-  log(`  ${n} destinataire(s) sans genre connu : {{TITLE}}/{{TERM}} seront ` +
-    `remplacés par du vide pour eux`, "line-err");
+// Un destinataire dont on ne connait ni le nom ni le genre n'est plus envoye
+// avec des blancs a la place ("Bonjour  Dupont") : il est ecarte en amont par
+// Python et rapporte ici. Les exclus peuvent etre des centaines, donc le
+// detail va dans le journal et seul le compte tient dans la confirmation.
+function logExcluded(exclus) {
+  if (!exclus || !exclus.length) return;
+  log(`  ${exclus.length} destinataire(s) écarté(s), faute de quoi le message ` +
+    `serait envoyé avec un blanc à la place du nom :`, "line-err");
+  exclus.forEach((e) => log(`     ${e.addr} — ${e.raison}`, "line-err"));
+}
+
+function dureeLisible(s) {
+  if (s >= 86400) return `${(s / 86400).toFixed(1)} j`;
+  if (s >= 3600) return `${(s / 3600).toFixed(1)} h`;
+  if (s >= 60) return `${Math.round(s / 60)} min`;
+  return `${Math.round(s)} s`;
+}
+
+let paused = false;
+
+// Pendant une campagne, Envoyer/Simuler laissent la place a Pause/Arreter :
+// une campagne etalee sur des heures doit pouvoir etre reprise en main, et
+// Simuler est de toute facon refuse cote Python tant qu'un envoi tourne.
+function setCampaignButtons(actif) {
+  paused = false;
+  $("btn-send").disabled = actif;
+  $("btn-send").textContent = actif ? "Envoi…" : "Envoyer";
+  $("btn-dry").disabled = actif;
+  $("btn-pause").hidden = !actif;
+  $("btn-stop").hidden = !actif;
+  $("btn-pause").textContent = "Pause";
+}
+
+async function togglePause() {
+  paused = !paused;
+  $("btn-pause").textContent = paused ? "Reprendre" : "Pause";
+  await (paused ? window.pywebview.api.pause() : window.pywebview.api.resume());
+  log(paused ? "campagne en pause" : "campagne reprise", "line-muted");
+}
+
+async function stopCampaign() {
+  if (!confirm("Arrêter la campagne ? Les messages déjà envoyés le restent.")) return;
+  $("btn-stop").disabled = true;
+  await window.pywebview.api.cancel();
+  $("btn-stop").disabled = false;
 }
 
 async function send() {
   if (sending) return;
   const p = collect();
-  const n = p.dests.length;
-  if (!n) { log("aucun destinataire", "line-err"); return; }
-  if (!confirm(`Envoyer à ${n} destinataire${n > 1 ? "s" : ""} ?`)) return;
+  if (!p.dests.length) { log("aucun destinataire", "line-err"); return; }
+
+  // Le preflight peut prendre un instant (resolution SMTP) : desactiver le
+  // bouton des maintenant, sinon un double-clic lance deux campagnes.
+  $("btn-send").disabled = true;
+  let pre;
+  try {
+    pre = await window.pywebview.api.preflight(p);
+  } finally {
+    $("btn-send").disabled = false;
+  }
+  if (pre.error) { log(pre.error, "line-err"); return; }
+
+  logExcluded(pre.excluded);
+
+  const lignes = [`Envoyer ${pre.messages} message${pre.messages > 1 ? "s" : ""} ` +
+                  `à ${pre.destinataires} destinataire${pre.destinataires > 1 ? "s" : ""} ?`];
+  if (pre.duree) {
+    lignes.push(`Étalé sur ${dureeLisible(pre.duree)} — un message toutes les ` +
+                `${dureeLisible(pre.ecartMoyen)} en moyenne.`);
+  }
+  if (pre.plage) {
+    const hh = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}h`;
+    lignes.push(`Envois entre ${hh(pre.plage[0])} et ${hh(pre.plage[1])} seulement.`);
+  }
+  if (pre.objets > 1) lignes.push(`${pre.objets} objets alternés.`);
+  if (pre.excluded.length) {
+    lignes.push(`${pre.excluded.length} adresse(s) écartée(s) — détail dans le journal.`);
+  }
+  if (pre.warnings.length) lignes.push("", ...pre.warnings.map((w) => "⚠ " + w));
+
+  if (!confirm(lignes.join("\n"))) return;
 
   sending = true;
-  $("btn-send").disabled = true;
-  $("btn-send").textContent = "Envoi…";
+  setCampaignButtons(true);
 
   const res = await window.pywebview.api.send(p);
   if (res.error) {
     log(res.error, "line-err");
     sending = false;
-    $("btn-send").disabled = false;
-    $("btn-send").textContent = "Envoyer";
+    setCampaignButtons(false);
     return;
   }
   log(`envoi lancé : ${res.dests} destinataire(s) en ${res.lots} lot(s)`);
-  warnMissingGender(res.missingGender);
 }
 
 // -------------------------------------------------------------- demarrage
@@ -312,6 +484,9 @@ function wire() {
   $("btn-load-deputies").addEventListener("click", loadDeputies);
   $("btn-dry").addEventListener("click", dryRun);
   $("btn-send").addEventListener("click", send);
+  $("btn-pause").addEventListener("click", togglePause);
+  $("btn-stop").addEventListener("click", stopCampaign);
+  $("btn-subject-add").addEventListener("click", addSubject);
   $("btn-log-clear").addEventListener("click", () => { $("log").innerHTML = ""; });
 
   $("body-text").placeholder = BODY_PLACEHOLDER;

@@ -15,9 +15,12 @@ Lancement : python app.py
 import csv
 import functools
 import json
+import random
+import re
 import smtplib
 import sys
 import threading
+import time
 from pathlib import Path
 
 import webview
@@ -83,6 +86,98 @@ def _deputy_genders():
             for d in _load_deputies() if d["genre"] in ("M", "F")}
 
 
+# Precision entre parentheses ajoutee au nom pour lever une ambiguite dans un
+# tableau ("Martin (Alpes-Maritimes)") : utile en colonne, pas dans une formule
+# d'appel — "Bonjour Mme. MARTIN (ALPES-MARITIMES)," serait pire que tout.
+_PRECISION_NOM = re.compile(r"\s*\([^)]*\)\s*$")
+
+
+@functools.lru_cache(maxsize=1)
+def _deputy_names():
+    """(table, partagees) — noms des deputes, et adresses problematiques.
+
+    table : {adresse en minuscules: (prenom, nom)}, source faisant autorite
+    pour {{FIRST}}/{{LAST}}. Une adresse que le CSV attribue a deux deputes
+    portant des noms differents en est retiree : choisir arbitrairement ferait
+    partir un mail au mauvais nom.
+
+    partagees : les adresses presentes sur plusieurs lignes du CSV, meme quand
+    le nom est identique. C'est un defaut du fichier, pas de l'envoi : deux
+    elues distinctes y partagent alexandra.martin@, donc l'une des deux ne sera
+    jamais contactee et l'autre recevra deux fois le meme message. Rien ici ne
+    peut le corriger — seulement le signaler pour que le CSV soit repare."""
+    par_adresse, lignes = {}, {}
+    for d in _load_deputies():
+        addr = d["email"].lower()
+        lignes[addr] = lignes.get(addr, 0) + 1
+        nom = _PRECISION_NOM.sub("", d["nom"]).strip()
+        if nom and d["prenom"]:
+            par_adresse.setdefault(addr, set()).add((d["prenom"], nom))
+    table = {a: noms.pop() for a, noms in par_adresse.items() if len(noms) == 1}
+    partagees = sorted(a for a, n in lignes.items() if n > 1)
+    return table, partagees
+
+
+# Quotas d'envoi quotidiens connus, par domaine expediteur. Table distincte de
+# sm.PROVIDERS, qui sert a trouver le serveur SMTP et repond a une autre
+# question : un domaine peut y figurer sans quota connu, et l'inverse.
+QUOTAS = {"gmail.com": 500, "googlemail.com": 500}
+
+UNITES_DUREE = {"minutes": 60, "heures": 3600, "jours": 86400}
+
+
+def _duree_secondes(valeur, unite):
+    """Duree de campagne en secondes. Vide -> 0, c'est-a-dire aucun etalement
+    (l'ancien comportement) ; le preflight le signale plutot que de l'imposer."""
+    if valeur in (None, ""):
+        return 0.0
+    try:
+        n = float(valeur)
+    except (TypeError, ValueError):
+        raise ValueError("duree de campagne invalide")
+    if n < 0:
+        raise ValueError("duree de campagne invalide")
+    return n * UNITES_DUREE.get(unite, 3600)
+
+
+def _minutes_jour(valeur, champ):
+    """"HH:MM" -> minutes depuis minuit, ou None si le champ est vide."""
+    if not valeur:
+        return None
+    try:
+        h, m = str(valeur).split(":")
+        h, m = int(h), int(m)
+    except (ValueError, AttributeError):
+        raise ValueError(f"{champ} : heure invalide ({valeur!r}), format attendu HH:MM")
+    if not (0 <= h < 24 and 0 <= m < 60):
+        raise ValueError(f"{champ} : heure invalide ({valeur!r})")
+    return h * 60 + m
+
+
+def _plage_horaire(debut, fin):
+    """(debut, fin) en minutes depuis minuit, ou None si aucune restriction.
+
+    Hors de cette plage la campagne se met en pause d'elle-meme : distribuer
+    des mails a 3 h du matin est une des heuristiques anti-bot les moins
+    cheres qui soient."""
+    d = _minutes_jour(debut, "debut de plage")
+    f = _minutes_jour(fin, "fin de plage")
+    if d is None or f is None or d == f:
+        return None
+    return (d, f)
+
+
+def dans_plage(plage, maintenant=None):
+    """La plage autorise-t-elle un envoi maintenant ? Gere le cas d'une plage
+    qui passe minuit (22:00-06:00)."""
+    if not plage:
+        return True
+    debut, fin = plage
+    t = maintenant if maintenant is not None else (
+        time.localtime().tm_hour * 60 + time.localtime().tm_min)
+    return debut <= t < fin if debut < fin else (t >= debut or t < fin)
+
+
 class _StderrRelay:
     """Redirige ce que send_mail.py ecrit sur stderr (detection SMTP, retries
     4xx, redecoupe des lots) vers le journal de la page. Sans ca ces messages
@@ -108,9 +203,44 @@ class Api:
 
     def __init__(self):
         self.window = None
+        # Tout etat interne reste prefixe par "_" : pywebview n'expose a JS que
+        # les attributs publics, et il parcourt recursivement ceux qui ne sont
+        # pas appelables — c'est ce parcours qui provoquait la boucle infinie
+        # sur window.native documentee dans main().
         self._sending = False
+        self._cancel = threading.Event()
+        self._pause = threading.Event()
 
     # ------------------------------------------------------------- interne
+
+    def _gate(self):
+        """Bloque tant que la campagne est en pause. False s'il faut arreter.
+
+        Verifie inconditionnellement, y compris quand l'attente qui suit est
+        nulle : sans ca, une pause demandee pile entre deux envois rapproches
+        resterait sans effet."""
+        while self._pause.is_set():
+            if self._cancel.wait(0.2):
+                return False
+        return not self._cancel.is_set()
+
+    def _wait(self, secondes):
+        """Attente interruptible. False si la campagne doit s'arreter.
+
+        Le restant est decremente du temps reellement ecoule (horloge
+        monotone) et non du pas theorique : sur plusieurs heures, supposer que
+        chaque tranche dure exactement 0,5 s derive de plusieurs dizaines de
+        secondes. La pause bloque dans _gate(), donc en dehors de l'intervalle
+        mesure : le temps passe en pause ne consomme pas l'attente."""
+        reste = secondes
+        while reste > 0:
+            if not self._gate():
+                return False
+            debut = time.monotonic()
+            if self._cancel.wait(min(reste, 0.5)):
+                return False
+            reste -= time.monotonic() - debut
+        return self._gate()
 
     def _emit(self, kind, payload=None):
         """Pousse un evenement vers la page (handler onAppEvent cote JS)."""
@@ -122,8 +252,14 @@ class Api:
         except Exception:
             pass  # fenetre fermee pendant un envoi
 
-    def _prepare(self, p):
+    def _prepare(self, p, melanger=False):
         """Valide les champs et construit la config d'envoi.
+
+        `melanger` n'est vrai que pour un envoi reel : dry_run et preflight
+        doivent rester reproductibles d'un clic a l'autre (meme ordre, meme
+        apercu), et en mode groupe un melange changerait la composition des
+        lots entre ce qui est annonce et ce qui part.
+
         Leve ValueError (champ invalide) ou sm.SendMailError (domaine SMTP)."""
         sender = (p.get("sender") or "").strip()
         if not sm.ADDR_RE.match(sender):
@@ -144,13 +280,29 @@ class Api:
             dests.append(adresse)
             if genre:
                 titres_lignes[adresse.lower()] = genre
-        dests = list(dict.fromkeys(dests))  # dedoublonne en gardant l'ordre
+        # Dedoublonnage insensible a la casse : les tables de genres et de noms
+        # sont toutes indexees en minuscules, et une fois l'ordre melange deux
+        # variantes de casse de la meme adresse partiraient a des heures
+        # differentes sans que personne ne remarque le doublon.
+        vues, uniques = set(), []
+        for d in dests:
+            if d.lower() not in vues:
+                vues.add(d.lower())
+                uniques.append(d)
+        dests = uniques
         if not dests:
             raise ValueError("aucun destinataire")
 
-        subject = (p.get("subject") or "").strip()
-        if not subject:
-            raise ValueError("objet manquant")
+        # Objets : la page peut en fournir plusieurs (bouton "+"), auquel cas
+        # chaque message tire le sien. Un objet stricttement identique sur des
+        # centaines d'envois est un des marqueurs releves.
+        subjects = [s.strip() for s in (p.get("subjects") or []) if s.strip()]
+        if not subjects:
+            unique = (p.get("subject") or "").strip()
+            if not unique:
+                raise ValueError("objet manquant")
+            subjects = [unique]
+        subject = subjects[0]
 
         body = p.get("body") or ""
         if not body.strip():
@@ -189,23 +341,51 @@ class Api:
         host, resolved_port = sm.resolve_smtp(
             sender, (p.get("smtpHost") or "").strip() or None, port)
 
-        lots = ([dests[i:i + batch] for i in range(0, len(dests), batch)]
-                if group else [[d] for d in dests])
-
         # Un titre ecrit sur la ligne prime sur le CSV des deputes : c'est un
         # choix explicite et visible de l'utilisateur. Le CSV reste le repli
         # pour une adresse de depute saisie sans titre, qui garde ainsi le
         # sien sans qu'on ait a le retaper.
         genres = {**_deputy_genders(), **titres_lignes}
-        sans_genre = 0
-        if sm.has_gender_placeholders(body):
-            sans_genre = sum(1 for d in dests if d.lower() not in genres)
+        noms, partagees = _deputy_names()
+
+        # Un destinataire n'est retenu que si le corps peut etre rendu
+        # entierement pour lui : un {{LAST}} laisse vide expedierait
+        # "Bonjour  ," — precisement le marqueur qu'on cherche a supprimer.
+        # (Le mode groupe ne passe jamais ici : il refuse deja tout placeholder
+        # plus haut.)
+        exclus = []
+        if sm.has_name_placeholders(body) or sm.has_gender_placeholders(body):
+            retenus = []
+            for d in dests:
+                cle = d.lower()
+                if sm.has_name_placeholders(body) and not sm.resolve_names(d, noms)[1]:
+                    exclus.append({"addr": d, "raison": "nom introuvable"})
+                elif sm.has_gender_placeholders(body) and cle not in genres:
+                    exclus.append({"addr": d, "raison": "genre inconnu"})
+                else:
+                    retenus.append(d)
+            dests = retenus
+            if not dests:
+                raise ValueError(
+                    f"aucun destinataire exploitable : les {len(exclus)} adresses "
+                    f"saisies n'ont ni nom ni genre identifiable, alors que le "
+                    f"corps utilise des placeholders")
+
+        if melanger:
+            random.shuffle(dests)
+
+        lots = ([dests[i:i + batch] for i in range(0, len(dests), batch)]
+                if group else [[d] for d in dests])
 
         return {
             "sender": sender, "host": host, "port": resolved_port,
-            "subject": subject, "body": body,
+            "subject": subject, "subjects": subjects, "body": body,
             "is_html": bool(p.get("isHtml")), "lots": lots,
-            "genres": genres, "sans_genre": sans_genre,
+            "genres": genres, "noms": noms, "sans_genre": len(exclus),
+            "exclus": exclus,
+            "partagees": [a for a in partagees if a in vues],
+            "duree": _duree_secondes(p.get("durationValue"), p.get("durationUnit")),
+            "plage": _plage_horaire(p.get("quietStart"), p.get("quietEnd")),
         }
 
     # -------------------------------------------------------------- exposees
@@ -254,12 +434,88 @@ class Api:
             "total": len(deputes),
         }
 
+    def preflight(self, p):
+        """Ce que l'utilisateur doit savoir avant de confirmer un envoi.
+
+        Calcule ici et non dans la page : quotas, cadence et exclusions sont
+        des regles metier, et app.js n'en duplique aucune. La page se contente
+        de mettre en forme ce qui est renvoye ici."""
+        try:
+            cfg = self._prepare(p)
+        except (ValueError, sm.SendMailError) as e:
+            return {"error": str(e)}
+
+        n = len(cfg["lots"])
+        duree = cfg["duree"]
+        ecart_moyen = (duree - n * sm.COUT_ENVOI) / max(n - 1, 1) if duree else 0.0
+
+        avertissements = []
+        quota = QUOTAS.get(cfg["sender"].rsplit("@", 1)[-1].lower())
+        if quota:
+            jours = max(duree / 86400.0, 0.0)
+            par_jour = n / jours if jours >= 1 else n
+            if par_jour > quota:
+                avertissements.append(
+                    f"{n} messages depassent le quota de {quota}/jour de ce "
+                    f"fournisseur" + (f" ({par_jour:.0f}/jour au rythme prevu)"
+                                       if jours >= 1 else "") +
+                    " — au-dela, les envois sont rejetes et le compte suspendu 24 h.")
+        if not duree:
+            avertissements.append(
+                "aucune duree de campagne : les messages partiront a la suite, "
+                "sans pause — c'est exactement ce qui fait bloquer un compte.")
+        elif ecart_moyen < 20:
+            avertissements.append(
+                f"cadence rapide : un message toutes les {ecart_moyen:.0f} s en "
+                f"moyenne. Allonger la duree reduit le risque de blocage.")
+        if sm.has_placeholders(cfg["subject"]):
+            avertissements.append(
+                "l'objet contient un placeholder ({{...}}) : il n'est pas "
+                "personnalise et partira tel quel.")
+        if cfg["partagees"]:
+            avertissements.append(
+                f"{len(cfg['partagees'])} adresse(s) designent plusieurs deputes "
+                f"dans le CSV : l'un d'eux ne sera pas contacte "
+                f"({', '.join(cfg['partagees'])}).")
+
+        return {
+            "messages": n,
+            "destinataires": sum(len(lot) for lot in cfg["lots"]),
+            "objets": len(cfg["subjects"]),
+            "duree": duree,
+            "ecartMoyen": ecart_moyen,
+            "plage": list(cfg["plage"]) if cfg["plage"] else None,
+            "excluded": cfg["exclus"],
+            "warnings": avertissements,
+        }
+
+    def cancel(self):
+        """Arrete la campagne en cours : elle s'interrompt entre deux messages
+        (ou pendant une attente), les deja partis restent partis."""
+        self._pause.clear()   # sinon le worker resterait bloque dans _gate()
+        self._cancel.set()
+        return {"ok": True}
+
+    def pause(self):
+        self._pause.set()
+        return {"ok": True}
+
+    def resume(self):
+        self._pause.clear()
+        return {"ok": True}
+
     def dry_run(self, p):
         """Simule : resout le serveur, verifie reellement l'authentification
         (connexion + login, sans envoyer aucun mail — la session est fermee
         aussitot), construit les lots, rend le corps personnalise pour le
         premier destinataire. Un mot de passe errone est ainsi detecte avant
         un envoi reel, pas pendant."""
+        # dry_run et le worker echangent tous deux sys.stderr, qui est global :
+        # lancer une simulation pendant une campagne ferait restaurer par le
+        # finally d'ici le relais du worker, definitivement, et tout ce que la
+        # bibliotheque ecrit ensuite disparaitrait du journal.
+        if self._sending:
+            return {"error": "une campagne est en cours — arrete-la avant de simuler"}
         relay = _StderrRelay(lambda ligne: self._emit("log", ligne))
         ancien, sys.stderr = sys.stderr, relay
         try:
@@ -291,12 +547,15 @@ class Api:
         corps = cfg["body"]
         personnalise = sm.has_placeholders(corps)
         if personnalise:
-            corps = sm.personalize(corps, premier, cfg["genres"].get(premier.lower()))
+            cle = premier.lower()
+            corps = sm.personalize(corps, premier, cfg["genres"].get(cle),
+                                   cfg["noms"].get(cle))
         return {
             "host": cfg["host"], "port": cfg["port"],
             "lots": [list(lot) for lot in cfg["lots"]],
             "body": corps, "personalizedFor": premier if personnalise else None,
             "isHtml": cfg["is_html"], "missingGender": cfg["sans_genre"],
+            "excluded": cfg["exclus"],
         }
 
     def send(self, p):
@@ -305,7 +564,7 @@ class Api:
         if self._sending:
             return {"error": "un envoi est deja en cours"}
         try:
-            cfg = self._prepare(p)
+            cfg = self._prepare(p, melanger=True)
         except (ValueError, sm.SendMailError) as e:
             return {"error": str(e)}
 
@@ -313,20 +572,46 @@ class Api:
         if not pwd:
             return {"error": "mot de passe manquant"}
 
+        # Remise a zero avant de lancer le thread, pas dans le finally du
+        # worker : cancel() peut legitimement arriver apres l'evenement "done",
+        # et une campagne suivante demarrerait alors deja annulee (ou pire,
+        # deja en pause, sans rien a l'ecran pour l'expliquer).
+        self._cancel.clear()
+        self._pause.clear()
         self._sending = True
         threading.Thread(target=self._send_worker, args=(cfg, pwd),
                          daemon=True).start()
         return {"started": True,
                 "lots": len(cfg["lots"]),
                 "dests": sum(len(lot) for lot in cfg["lots"]),
-                "missingGender": cfg["sans_genre"]}
+                "missingGender": cfg["sans_genre"],
+                "excluded": cfg["exclus"]}
 
     # ---------------------------------------------------- thread d'envoi
+
+    def _attendre_plage(self, plage):
+        """Suspend la campagne hors de la plage horaire autorisee.
+
+        False si l'utilisateur arrete pendant l'attente. Les creneaux sont
+        reevalues chaque minute : inutile de calculer la duree exacte jusqu'a
+        l'ouverture, et ca reste juste si la machine dort ou change d'heure."""
+        prevenu = False
+        while not dans_plage(plage):
+            if not prevenu:
+                debut, fin = plage
+                self._emit("log", f"  (hors plage horaire {debut // 60:02d}h-"
+                                   f"{fin // 60:02d}h — campagne suspendue)")
+                self._emit("progress", {"etat": "hors-plage"})
+                prevenu = True
+            if not self._wait(60):
+                return False
+        return self._gate()
 
     def _send_worker(self, cfg, pwd):
         sender, host, port = cfg["sender"], cfg["host"], cfg["port"]
         relay = _StderrRelay(lambda ligne: self._emit("log", ligne))
         ancien, sys.stderr = sys.stderr, relay
+        traites, raison, total = 0, "erreur", len(cfg["lots"])
 
         def connect_fn():
             return sm.connect(host, port, sender, pwd)
@@ -348,14 +633,27 @@ class Api:
                 self._emit("error", f"erreur inattendue a la connexion : {e!r}")
                 return
 
+            lots = cfg["lots"]
+            ecarts = sm.gaps(len(lots), cfg["duree"]) if cfg["duree"] else []
             ok_total, echecs_total = [], []
+            raison = "fini"
             try:
-                for lot in cfg["lots"]:
+                for i, lot in enumerate(lots):
+                    # Hors plage horaire : on attend ici plutot que d'envoyer a
+                    # 3 h du matin. La pause manuelle passe par le meme verrou.
+                    if not self._attendre_plage(cfg["plage"]):
+                        raison = "annule"
+                        break
+
+                    if conn[0] is None:
+                        conn[0] = connect_fn()
+                    debut = time.monotonic()
                     ok, echecs = sm.send_lot(conn, connect_fn, sender, lot,
-                                              cfg["subject"], cfg["body"],
-                                              cfg["is_html"],
+                                              random.choice(cfg["subjects"]),
+                                              cfg["body"], cfg["is_html"],
                                               sm.RETRY_MAX_ATTEMPTS,
-                                              cfg["genres"])
+                                              cfg["genres"], cfg["noms"],
+                                              self._wait)
                     if ok:
                         self._emit("ok", ok)
                     for addr, detail in echecs:
@@ -363,8 +661,42 @@ class Api:
                                              "detail": sm.fmt_smtp(detail)})
                     ok_total += ok
                     echecs_total += echecs
+                    traites = i + 1
+
+                    # L'attente prevue est amputee du temps deja passe a
+                    # envoyer (et a reessayer) : sans ca la campagne deborde de
+                    # son budget et l'heure de fin annoncee derive des le debut.
+                    attente = max(0.0, (ecarts[i] if i < len(ecarts) else 0.0)
+                                  - (time.monotonic() - debut))
+                    self._emit("progress", {
+                        "faits": traites, "total": len(lots),
+                        "ok": len(ok_total), "ko": len(echecs_total),
+                        "attente": round(attente, 1),
+                    })
+                    if traites == len(lots):
+                        break
+
+                    # Une connexion tenue ouverte pendant des minutes se fait
+                    # couper par le serveur et ne ressemble a aucun client
+                    # reel, qui se connecte, envoie, puis raccroche.
+                    if attente > 60:
+                        try:
+                            conn[0].quit()
+                        except smtplib.SMTPException:
+                            pass
+                        conn[0] = None
+                    if not self._wait(attente):
+                        raison = "annule"
+                        break
+            except sm.SendInterrupted:
+                raison = "annule"
+            except sm.SendThrottled as e:
+                raison = "throttle"
+                self._emit("error", f"campagne interrompue : {e}. Reprends plus "
+                                     f"tard, en allongeant la duree.")
             except smtplib.SMTPAuthenticationError as e:
                 # reconnexion en cours de route refusee
+                raison = "erreur"
                 self._emit("error", sm.auth_error_msg(host, sender, e))
             except Exception as e:
                 # Meme filet de securite pendant l'envoi : send_lot() gere
@@ -372,10 +704,12 @@ class Api:
                 # si quelque chose d'imprevu passe au travers, ca doit quand
                 # meme finir dans le journal plutot que de tuer le thread en
                 # silence — les lots restants du batch sont alors abandonnes.
+                raison = "erreur"
                 self._emit("error", f"erreur inattendue pendant l'envoi : {e!r}")
             finally:
                 try:
-                    conn[0].quit()
+                    if conn[0] is not None:
+                        conn[0].quit()
                 except smtplib.SMTPException:
                     pass
 
@@ -383,7 +717,11 @@ class Api:
         finally:
             sys.stderr = ancien
             self._sending = False
-            self._emit("done")
+            # "restants" n'est pas un echec : ces destinataires n'ont jamais
+            # ete tentes. Le resume {ok, ko} seul ne sait pas dire la
+            # difference, alors qu'apres un arret c'est le gros du fichier.
+            self._emit("done", {"raison": raison,
+                                 "restants": max(total - traites, 0)})
 
 
 def main():
@@ -421,6 +759,18 @@ def main():
     # methode de Api n'utilise self.window avant un clic utilisateur, donc
     # rien ne peut l'appeler avant que "loaded" se soit declenche.
     window.events.loaded += lambda: setattr(api, "window", window)
+
+    # Fermer la fenetre doit arreter la campagne. Le thread est daemon, donc
+    # l'interpreteur finirait par le tuer, mais sans garantie de moment : une
+    # campagne etalee sur des heures continuerait d'envoyer alors que
+    # l'utilisateur croit avoir tout arrete. _pause est relache d'abord, sinon
+    # le worker resterait bloque dans _gate() au lieu de se derouler.
+    def _arreter_a_la_fermeture():
+        api._pause.clear()
+        api._cancel.set()
+        return True   # ne bloque pas la fermeture
+
+    window.events.closing += _arreter_a_la_fermeture
 
     try:
         # La page est chargee en file:// : aucun socket ouvert, donc pas de

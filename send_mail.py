@@ -20,10 +20,17 @@ lot). Un lot de taille 1 est le cas par defaut (un mail par destinataire) ;
 un lot plus grand correspond a un envoi groupe (tous en To).
 
 Personnalisation : {{FIRST}}/{{LAST}} dans le corps sont remplaces par
-destinataire (voir personalize()/split_name()), a partir de la partie locale
-(avant @) de son adresse. Avec un '.' : FIRST = avant le premier point, LAST
-= tout ce qui suit. Sans '.' : FIRST vide, LAST = toute la partie locale.
-N'a de sens que pour un lot de taille 1 (voir send_lot()).
+destinataire (voir personalize()). Les noms viennent d'une table fournie par
+l'appelant — le CSV des deputes, qui fait autorite ; a defaut seulement,
+derive_names() tente une deduction depuis la partie locale de l'adresse, et
+ne rend rien des qu'il y a le moindre doute. Une adresse sans nom fiable doit
+etre ecartee en amont plutot que personnalisee a vide : "Bonjour  CONTACT,"
+est la signature meme d'un envoi sur liste. N'a de sens que pour un lot de
+taille 1 (voir send_lot()).
+
+Cadence : gaps() repartit N envois sur une duree donnee avec des ecarts
+aleatoires bornes, cout d'envoi deduit. C'est l'appelant qui attend entre deux
+lots — send_lot() ne connait que ses propres reessais.
 
 Extraction d'adresses : read_list()/scan_addresses() tolerent du texte libre
 (CSV, "Nom <adresse>", copier-coller de tableur) — voir leur docstring.
@@ -31,14 +38,21 @@ Extraction d'adresses : read_list()/scan_addresses() tolerent du texte libre
 import json
 import random
 import re
+import secrets
 import smtplib
 import ssl
 import sys
 import time
 from email.message import EmailMessage
+from email.utils import formatdate
 from pathlib import Path
 
 import html2text
+
+# Identification de l'emetteur dans le header User-Agent. Honnete : se faire
+# passer pour Thunderbird ne tromperait aucun filtre serieux (ils pesent le
+# comportement, pas cette chaine) et serait une fausse declaration.
+USER_AGENT = "depharass/1.0"
 
 # Validation stricte d'une adresse saisie telle quelle (De, une ligne de
 # Destinataires) : uniquement les caracteres effectivement valides dans une
@@ -60,10 +74,26 @@ class SendMailError(Exception):
     Levee par les fonctions reutilisables (resolve_smtp, read_list) plutot que
     sys.exit, pour rester appelables depuis un appelant non-CLI (ex. une GUI)."""
 
+
+class SendInterrupted(SendMailError):
+    """L'appelant a demande l'arret pendant une attente (voir l'argument
+    `attendre` de send_lot). Les destinataires restants n'ont pas ete tentes,
+    ce qui n'est pas la meme chose qu'un echec."""
+
+
+class SendThrottled(SendMailError):
+    """Le serveur demande de ralentir de facon repetee. Insister message par
+    message ne ferait qu'aggraver le probleme : c'est a l'appelant d'arreter
+    la campagne et de la reprendre plus tard."""
+
 # Exceptions dont le vrai serveur SMTP ne correspond a aucun des schemas
 # devines par resolve_smtp (smtp./mail./smtp.mail.<domaine>). Domaine (en
 # minuscules) -> (hote SMTP, port) ; --smtp-host/--smtp-port passent outre.
 PROVIDERS = {
+    # gmail.com suit pourtant le schema smtp.<domaine>, mais l'y laisser
+    # deviner coutait une connexion de test a chaque simulation/envoi pour le
+    # domaine expediteur le plus courant.
+    "gmail.com": ("smtp.gmail.com", 587),
     "googlemail.com": ("smtp.gmail.com", 587),
     "outlook.com": ("smtp.office365.com", 587),
     "outlook.fr": ("smtp.office365.com", 587),
@@ -85,15 +115,22 @@ NO_SMTP = {
 }
 
 # Backoff exponentiel sur les erreurs 4xx (temporaires par definition RFC 5321,
-# throttling/quota/surcharge serveur). Bornes basses volontairement : ce script
-# est un envoi synchrone en premier plan, pas une file d'attente de MTA — les
-# vraies politiques des providers (Gmail, Outlook...) recommandent des delais
-# de plusieurs minutes a plusieurs heures entre tentatives, inadapte ici. Pour
-# un throttling persistant, relance le script plus tard plutot que d'allonger
-# ces constantes.
-RETRY_MAX_ATTEMPTS = 5
-RETRY_BASE_DELAY = 2.0    # secondes, double a chaque tentative
-RETRY_MAX_DELAY = 30.0    # plafond par attente
+# throttling/quota/surcharge serveur). Delais volontairement longs : un 4xx
+# veut le plus souvent dire "tu vas trop vite", et reessayer 2 s plus tard est
+# exactement l'inverse de ce qui est demande — c'est une des causes probables
+# des comptes bloques. Les campagnes etant desormais etalees dans le temps
+# (voir gaps() et le worker de app.py), rien n'impose plus des bornes basses.
+RETRY_MAX_ATTEMPTS = 4
+RETRY_BASE_DELAY = 60.0    # secondes, double a chaque tentative
+RETRY_MAX_DELAY = 900.0    # plafond par attente (15 min)
+
+# Codes et formulations qui signifient "ralentis", par opposition a une panne
+# ponctuelle. Y insister n'aide pas : au bout de THROTTLE_ABANDON refus
+# consecutifs, l'appelant est cense arreter la campagne (voir SendThrottled).
+THROTTLE_CODES = {421, 450, 451, 452}
+THROTTLE_INDICES = ("rate", "limit", "throttl", "too many", "quota",
+                    "try again", "slow down", "deferred", "unusual")
+THROTTLE_ABANDON = 3
 
 
 def fmt_smtp(detail):
@@ -330,8 +367,34 @@ PLACEHOLDERS = ("{{FIRST}}", "{{LAST}}", "{{TITLE}}", "{{TERM}}")
 # externe (voir l'argument `genre` de personalize()).
 GENDER_PLACEHOLDERS = ("{{TITLE}}", "{{TERM}}")
 
+# Sous-ensemble qui exige un nom identifiable (voir resolve_names()).
+NAME_PLACEHOLDERS = ("{{FIRST}}", "{{LAST}}")
+
 TITRES = {"M": "M.", "F": "Mme."}
 TERMINAISONS = {"M": "", "F": "e"}
+
+# Boites generiques : jamais le nom d'une personne. Une telle adresse ne doit
+# pas produire "Bonjour  CONTACT" — elle n'est simplement pas personnalisable.
+BOITES_GENERIQUES = {
+    "contact", "info", "infos", "secretariat", "accueil", "presse", "cabinet",
+    "permanence", "mairie", "depute", "deputee", "assemblee", "circonscription",
+    "admin", "webmaster", "postmaster", "noreply", "no-reply", "bureau",
+    "assistant", "assistante", "communication", "courrier",
+}
+
+# Un morceau de nom : au moins deux lettres (accents compris), separees au
+# besoin par un trait d'union ou une apostrophe ("anne-marie", "o'brien").
+# Ecarte les chiffres, les codes, et les initiales seules — "j.dupont" ne doit
+# pas donner "Bonjour J DUPONT".
+_MORCEAU_NOM = re.compile(r"^[^\W\d_](?:['’-]?[^\W\d_])+$")
+
+
+def _capitaliser(morceau):
+    """Capitalise chaque partie d'un nom compose : anne-marie -> Anne-Marie."""
+    out = morceau
+    for sep in ("-", "'", "’"):
+        out = sep.join(p[:1].upper() + p[1:] for p in out.split(sep))
+    return out
 
 
 def has_placeholders(body):
@@ -342,53 +405,126 @@ def has_gender_placeholders(body):
     return any(p in body for p in GENDER_PLACEHOLDERS)
 
 
-def split_name(addr):
-    """Derive (FIRST, LAST) a partir de la partie locale (avant @) de addr.
-    Avec un '.' : FIRST = avant le premier point, LAST = tout ce qui suit
-    (points suivants inclus). Sans '.' : FIRST vide, LAST = toute la partie
-    locale. Casse d'origine preservee, pas de capitalisation automatique."""
-    local = addr.split("@", 1)[0]
-    if "." in local:
-        first, _, last = local.partition(".")
-    else:
-        first, last = "", local
-    return first, last
+def has_name_placeholders(body):
+    return any(p in body for p in NAME_PLACEHOLDERS)
 
 
-def personalize(body, addr, genre=None):
+def derive_names(addr):
+    """(prenom, nom) devines depuis la partie locale, ou (None, None).
+
+    Ne devine que sur un motif "prenom.nom" franc : tout le reste — boite
+    generique, mot unique, plus de deux morceaux, chiffres — ne renvoie rien.
+    Mieux vaut ne pas personnaliser que d'ecrire "Bonjour  CONTACT", qui est
+    la signature meme d'un envoi sur liste.
+
+    Ce qu'on devine ici reste une approximation : "marine.lepen" donne "Lepen"
+    et non "Le Pen", les particules et noms composes sont perdus. C'est le
+    repli pour une adresse saisie a la main ; les deputes passent par le CSV,
+    qui fait autorite (voir resolve_names)."""
+    local = addr.split("@", 1)[0].lower()
+    prenom, _, nom = local.partition(".")
+    if not nom or local in BOITES_GENERIQUES:
+        return None, None
+    if prenom in BOITES_GENERIQUES or nom in BOITES_GENERIQUES:
+        return None, None
+    if not (_MORCEAU_NOM.match(prenom) and _MORCEAU_NOM.match(nom)):
+        return None, None
+    return _capitaliser(prenom), nom
+
+
+def resolve_names(addr, table=None):
+    """(prenom, nom) pour addr, ou (None, None) si rien de fiable.
+
+    `table` — {adresse en minuscules: (prenom, nom)} — fait autorite : c'est
+    le CSV des deputes, ou les noms sont exacts. Une adresse absente retombe
+    sur la deduction depuis l'adresse elle-meme."""
+    depuis_table = (table or {}).get(addr.lower())
+    if depuis_table:
+        return depuis_table
+    return derive_names(addr)
+
+
+def personalize(body, addr, genre=None, names=None):
     """Remplace les placeholders dans body pour le destinataire addr.
 
-    {{FIRST}}/{{LAST}} viennent de l'adresse (voir split_name). {{LAST}} est
-    mis en majuscules a la substitution (convention "Prenom NOM"), pas
-    {{FIRST}} — split_name() lui-meme garde la casse d'origine, c'est un
-    choix de presentation propre a personalize().
+    `names` — le couple (prenom, nom) deja resolu par l'appelant, qui a acces
+    au CSV. A defaut, resolve_names() se debrouille avec la seule adresse.
+    {{LAST}} part en majuscules (convention "Prenom NOM") ; resolve_names()
+    garde la casse d'origine, c'est un choix de presentation propre a
+    personalize().
+
     {{TITLE}} -> "M."/"Mme." et {{TERM}} -> ""/"e" (accord grammatical :
     "inscrit{{TERM}}") demandent `genre` valant "M" ou "F".
 
-    Genre inconnu (None) : les deux deviennent des chaines vides. Rien ne
-    peut etre devine depuis une adresse seule, et laisser "{{TITLE}}" visible
-    dans le mail expedie serait pire qu'un blanc — l'appelant est prevenu en
-    amont (voir has_gender_placeholders)."""
-    first, last = split_name(addr)
+    Genre ou nom inconnu : les placeholders concernes deviennent des chaines
+    vides. C'est un filet, pas un mode de fonctionnement — l'appelant est
+    cense avoir ecarte ces destinataires en amont (voir has_name_placeholders
+    et has_gender_placeholders), justement pour ne jamais expedier
+    "Bonjour  ,"."""
+    prenom, nom = names if names else resolve_names(addr)
     titre = TITRES.get(genre, "") if genre else ""
     terminaison = TERMINAISONS.get(genre, "") if genre else ""
     return (body
-            .replace("{{FIRST}}", first)
-            .replace("{{LAST}}", last.upper())
+            .replace("{{FIRST}}", prenom or "")
+            .replace("{{LAST}}", (nom or "").upper())
             .replace("{{TITLE}}", titre)
             .replace("{{TERM}}", terminaison))
 
 
+# Enveloppe HTML minimale. Quill ne produit qu'une soupe de <p> ; un vrai
+# client mail envoie toujours un document complet avec un <head>.
+HTML_DOC = ('<!DOCTYPE html>\n<html>\n<head>\n'
+            '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">\n'
+            '</head>\n<body>\n{corps}\n</body>\n</html>')
+
+
+def _boundary():
+    """Frontiere MIME de la forme qu'emettent les clients courants. La stdlib
+    genere sinon "===============<19 chiffres>==", signature Python
+    reconnaissable au premier coup d'oeil."""
+    return "------------" + secrets.token_hex(12)
+
+
+def _message_id(sender):
+    """Message-ID sur le domaine de l'expediteur.
+
+    email.utils.make_msgid() est ecarte volontairement : il divulgue le nom
+    d'hote de la machine (<...@mon-portable>) et sa forme
+    <horodatage.pid.aleatoire@...> est une empreinte Python."""
+    domaine = sender.rsplit("@", 1)[-1]
+    return f"<{secrets.token_hex(16)}@{domaine}>"
+
+
 def build(sender, to, subject, body, is_html=False):
+    """Construit le message, headers poses explicitement dans l'ordre ou un
+    client mail les emet.
+
+    Date et Message-ID etaient absents : Date est pourtant obligatoire
+    (RFC 5322), et leur absence a la soumission est anormale en soi — Gmail
+    les rajoute silencieusement, la plupart des autres serveurs non."""
     msg = EmailMessage()
-    msg["From"] = sender
+    msg["Message-ID"] = _message_id(sender)
+    msg["Date"] = formatdate(localtime=True)
+    msg["MIME-Version"] = "1.0"
+    msg["User-Agent"] = USER_AGENT
     msg["To"] = ", ".join(to)
+    msg["From"] = sender
     msg["Subject"] = subject
+
+    # cte explicite : sans lui Python encode en base64 des qu'il y a un accent.
+    # Un corps de prose integralement en base64 ne ressemble a aucun client
+    # grand public — et c'etait le cas de tous les mails francais partis d'ici.
     if is_html:
-        msg.set_content(html_to_text(body) or " ")
-        msg.add_alternative(body, subtype="html")
+        msg.set_content(html_to_text(body) or " ", cte="quoted-printable")
+        msg.add_alternative(HTML_DOC.format(corps=body), subtype="html",
+                            cte="quoted-printable")
+        msg.set_boundary(_boundary())
+        # add_alternative() glisse un MIME-Version dans la sous-partie HTML :
+        # ce header n'a de sens qu'en tete du message, jamais dans une partie.
+        for partie in msg.iter_parts():
+            del partie["MIME-Version"]
     else:
-        msg.set_content(body)
+        msg.set_content(body, cte="quoted-printable")
     return msg
 
 
@@ -399,67 +535,186 @@ def connect(host, port, sender, pwd):
     return s
 
 
+# Cout moyen d'un envoi (TCP + TLS + AUTH + DATA + QUIT), retranche du budget :
+# sans ca une campagne de 577 messages deborde d'une demi-heure et l'heure de
+# fin annoncee est fausse des la premiere minute.
+COUT_ENVOI = 3.0
+
+# Bornes d'un ecart, en multiples de l'ecart moyen.
+ECART_MIN, ECART_MAX = 0.2, 3.0
+
+
+def gaps(n, duree, cout_envoi=COUT_ENVOI):
+    """Ecarts en secondes entre `n` envois etales sur `duree`.
+
+    Renvoie n-1 valeurs : on n'attend pas apres le dernier message.
+
+    Tirage exponentiel plutot que regulier — un intervalle constant au
+    metronome est en soi un marqueur. Les valeurs sont bornees autour de la
+    moyenne, puis l'ecart au budget est reparti sur celles qui ont encore de
+    la marge : renormaliser tout le vecteur d'un coup ressortirait des valeurs
+    hors bornes."""
+    k = max(n - 1, 0)
+    if k == 0:
+        return []
+    budget = duree - n * cout_envoi
+    if budget <= 0:
+        # Duree plus courte que le temps d'envoi lui-meme. On etale quand meme
+        # sur la duree brute plutot que de renvoyer des ecarts nuls : la
+        # campagne debordera, mais rendre le champ silencieusement inoperant
+        # ramenerait au tir en rafale qu'on cherche justement a eviter. Le
+        # preflight, lui, previent que la cadence est trop rapide.
+        budget = duree
+    moyenne = budget / k
+    if moyenne <= 0:
+        return [0.0] * k
+
+    bas, haut = ECART_MIN * moyenne, ECART_MAX * moyenne
+    ecarts = [min(max(random.expovariate(1 / moyenne), bas), haut)
+              for _ in range(k)]
+    for _ in range(20):
+        residu = budget - sum(ecarts)
+        if abs(residu) < 0.5:
+            break
+        souples = [i for i, g in enumerate(ecarts)
+                   if (residu > 0 and g < haut) or (residu < 0 and g > bas)]
+        if not souples:
+            break
+        part = residu / len(souples)
+        for i in souples:
+            ecarts[i] = min(max(ecarts[i] + part, bas), haut)
+    return ecarts
+
+
+def est_throttling(code, message):
+    """Le serveur demande-t-il de ralentir, par opposition a une panne ?"""
+    if code in THROTTLE_CODES:
+        return True
+    texte = (message.decode(errors="replace") if isinstance(message, bytes)
+             else str(message)).lower()
+    return any(indice in texte for indice in THROTTLE_INDICES)
+
+
 def send_lot(conn, connect_fn, sender, lot, subject, body, is_html, max_retries,
-             genres=None):
+             genres=None, noms=None, attendre=None):
     """Envoie un mail a `lot` en gerant les erreurs SMTP transitoires.
 
     `conn` est une liste a 1 element portant la connexion active (mutable,
-    pour pouvoir la remplacer sur reconnexion). Gere :
-      - 452 sur tout le lot (SMTPRecipientsRefused) : lot trop grand pour ce
-        serveur (limite RCPT TO) -> redecoupe en deux et reessaie chaque
-        moitie immediatement, sans attente (c'est structurel, pas temporaire) ;
+    pour pouvoir la remplacer sur reconnexion).
+
+    `attendre(secondes) -> bool` dit *comment* patienter, et renvoie False si
+    l'appelant veut arreter — ce qui leve SendInterrupted. Par defaut
+    time.sleep, donc rien ne change pour un appelant que ca n'interesse pas.
+    C'est ce qui permet a la GUI d'interrompre une campagne pendant une attente
+    de 15 min sans importer ici la moindre notion de thread ou de fenetre.
+
+    Gere :
+      - 452 sur tout le lot : lot trop grand pour ce serveur (limite RCPT TO)
+        -> redecoupe en deux, apres une pause ;
+      - throttling (voir est_throttling) : backoff long, puis SendThrottled —
+        insister message par message ne fait qu'aggraver, c'est a l'appelant
+        d'arreter la campagne ;
       - refus partiel (certaines adresses seulement, pas d'exception levee) :
         rapporte comme echec definitif par adresse, pas de retry (une adresse
         invalide/pleine le reste) ;
-      - 4xx generique (throttling, surcharge serveur au niveau DATA/MAIL) :
-        backoff exponentiel borne, jusqu'a max_retries tentatives ;
-      - erreur reseau (OSError : hote injoignable, connexion refusee/reset,
-        timeout) : meme traitement que le 4xx generique ci-dessus ;
-      - connexion perdue en cours de route : reconnexion puis reessai ;
+      - 4xx generique et erreurs reseau (OSError) : backoff exponentiel borne ;
+      - connexion perdue en cours de route : reconnexion, sans consommer de
+        tentative ;
       - 5xx ou tentatives epuisees : echec definitif.
 
     Si lot est un destinataire unique, les placeholders de body sont
     personnalises pour cette adresse avant l'envoi (voir personalize()).
-    `genres` est un dict {adresse en minuscules: "M"/"F"} pour {{TITLE}} et
-    {{TERM}} ; une adresse absente donne un genre inconnu, pas une erreur.
+    `genres` est {adresse en minuscules: "M"/"F"} et `noms`
+    {adresse en minuscules: (prenom, nom)} ; une adresse absente donne un
+    genre/nom inconnu, pas une erreur — l'appelant est cense avoir ecarte en
+    amont les destinataires non personnalisables.
 
     Renvoie (ok: liste d'adresses envoyees, echecs: liste de (adresse, detail)).
+    Leve SendInterrupted (arret demande) ou SendThrottled (le serveur insiste).
     """
+    dors = attendre or (lambda s: (time.sleep(s), True)[1])
+    throttles = 0
+
+    def patienter(raison, attempt):
+        """Backoff avec demi-jitter. Leve SendInterrupted si l'appelant veut
+        arreter — sans quoi une annulation resterait invisible jusqu'a 15 min."""
+        plafonne = min(delay, RETRY_MAX_DELAY)
+        wait = plafonne / 2 + random.uniform(0, plafonne / 2)
+        print(f"  ({raison}, tentative {attempt}/{max_retries}, "
+              f"nouvel essai dans {wait:.0f}s...)", file=sys.stderr)
+        if not dors(wait):
+            raise SendInterrupted("envoi interrompu pendant une attente de reessai")
+
     if len(lot) == 1:
-        body = personalize(body, lot[0], (genres or {}).get(lot[0].lower()))
+        cle = lot[0].lower()
+        body = personalize(body, lot[0], (genres or {}).get(cle),
+                           (noms or {}).get(cle))
     delay = RETRY_BASE_DELAY
-    for attempt in range(1, max_retries + 1):
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
         try:
             refused = conn[0].send_message(build(sender, lot, subject, body, is_html))
             ok = [a for a in lot if a not in refused]
             echecs = [(a, refused[a]) for a in refused]
             return ok, echecs
         except smtplib.SMTPServerDisconnected:
+            # Ne consomme pas de tentative : une coupure n'est pas un refus, et
+            # sur un serveur qui throttle elle suit immediatement un 421 —
+            # la decompter epuiserait le budget sur un seul vrai refus.
             print("  (connexion perdue, reconnexion...)", file=sys.stderr)
+            attempt -= 1
             conn[0] = connect_fn()
             continue
         except smtplib.SMTPRecipientsRefused as e:
-            if len(lot) > 1 and any(code == 452 for code, _ in e.recipients.values()):
+            reponses = list(e.recipients.values())
+            if len(lot) > 1 and any(code == 452 for code, _ in reponses):
                 mid = len(lot) // 2
                 print(f"  (452 sur le lot de {len(lot)} — trop de destinataires "
                       f"pour ce serveur, redecoupe en {mid}+{len(lot) - mid})",
                       file=sys.stderr)
+                # Attente avant de redecouper : repartir aussitot doublerait le
+                # debit a l'instant precis ou le serveur demande de ralentir.
+                patienter("redecoupe du lot", attempt)
                 ok1, ko1 = send_lot(conn, connect_fn, sender, lot[:mid], subject,
-                                     body, is_html, max_retries, genres)
+                                     body, is_html, max_retries, genres, noms,
+                                     attendre)
                 ok2, ko2 = send_lot(conn, connect_fn, sender, lot[mid:], subject,
-                                     body, is_html, max_retries, genres)
+                                     body, is_html, max_retries, genres, noms,
+                                     attendre)
                 return ok1 + ok2, ko1 + ko2
+            # C'est ici qu'atterrissent les 421 : smtplib leve
+            # SMTPRecipientsRefused des que tous les RCPT sont refuses, jamais
+            # SMTPResponseException. Les traiter en echec definitif (ancien
+            # comportement) marquait tout le monde en echec puis reconnectait
+            # aussitot a pleine vitesse — le martelement meme qui fait bloquer
+            # un compte.
+            if any(est_throttling(c, m) for c, m in reponses):
+                throttles += 1
+                if throttles >= THROTTLE_ABANDON or attempt >= max_retries:
+                    raise SendThrottled(
+                        f"le serveur ralentit les envois de facon repetee "
+                        f"({fmt_smtp(reponses[0])})")
+                patienter("le serveur demande de ralentir", attempt)
+                delay *= 2
+                continue
             return [], list(e.recipients.items())
         except (smtplib.SMTPResponseException, smtplib.SMTPSenderRefused) as e:
             code = getattr(e, "smtp_code", None)
+            message = getattr(e, "smtp_error", str(e))
             transitoire = code is not None and 400 <= code < 500
+            if transitoire and est_throttling(code, message):
+                throttles += 1
+                if throttles >= THROTTLE_ABANDON or attempt >= max_retries:
+                    raise SendThrottled(
+                        f"le serveur ralentit les envois de facon repetee "
+                        f"({fmt_smtp((code, message))})")
+                patienter("le serveur demande de ralentir", attempt)
+                delay *= 2
+                continue
             if not transitoire or attempt == max_retries:
-                detail = (code, getattr(e, "smtp_error", str(e)))
-                return [], [(a, detail) for a in lot]
-            wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
-            print(f"  (erreur {code} temporaire, tentative {attempt}/{max_retries}, "
-                  f"nouvel essai dans {wait:.0f}s...)", file=sys.stderr)
-            time.sleep(wait)
+                return [], [(a, (code, message)) for a in lot]
+            patienter(f"erreur {code} temporaire", attempt)
             delay *= 2
         except OSError as e:
             # Destinataire/serveur injoignable au niveau reseau (connexion
@@ -470,10 +725,7 @@ def send_lot(conn, connect_fn, sender, lot, subject, body, is_html, max_retries,
             # seul, contrairement a un rejet SMTP explicite.
             if attempt == max_retries:
                 return [], [(a, (None, f"erreur reseau : {e}")) for a in lot]
-            wait = min(delay, RETRY_MAX_DELAY) + random.uniform(0, 1)
-            print(f"  (erreur reseau ({e}), tentative {attempt}/{max_retries}, "
-                  f"nouvel essai dans {wait:.0f}s...)", file=sys.stderr)
-            time.sleep(wait)
+            patienter(f"erreur reseau ({e})", attempt)
             delay *= 2
     return [], [(a, (None, "tentatives epuisees")) for a in lot]
 

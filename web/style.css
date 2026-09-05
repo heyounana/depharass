@@ -259,6 +259,60 @@ input.narrow { width: 88px; flex: none; }
 }
 .dests-buttons button { width: 100%; white-space: nowrap; }
 
+/* Objets alternes : une puce par objet memorise, avec sa croix de retrait. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  list-style: none;
+  margin: 8px 0 4px;
+  padding: 0;
+}
+
+.chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fff;
+  font-size: 12.5px;
+}
+
+.chip > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip-x {
+  padding: 0 4px;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chip-x:hover { color: var(--err); background: none; }
+
+button.danger { color: var(--err); border-color: #e6bcb6; }
+button.danger:hover:not(:disabled) { background: #fdf0ee; }
+
+/* Le <select> n'herite pas de la mise en forme des <input>. */
+select {
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+}
+
 .hint { color: var(--muted); font-size: 12.5px; }
 
 .hint code {

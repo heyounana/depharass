@@ -36,7 +36,15 @@
     </div>
 
     <label for="subject">Objet</label>
-    <input id="subject" type="text" autocomplete="off">
+    <div>
+      <div class="row">
+        <input id="subject" type="text" autocomplete="off">
+        <button id="btn-subject-add" type="button" class="ghost narrow"
+                title="Ajouter cet objet à la liste : chaque message en tirera un au hasard">+</button>
+      </div>
+      <ul id="subject-list" class="chips" hidden></ul>
+      <span class="hint" id="subject-hint" hidden></span>
+    </div>
 
     <label>
       Corps
@@ -77,6 +85,27 @@
         <span class="hint">tous les destinataires d'un lot se voient en To</span>
       </div>
 
+      <label for="duration-value">Durée</label>
+      <div class="row">
+        <input id="duration-value" type="number" min="0" step="0.5" value="6" class="narrow">
+        <select id="duration-unit">
+          <option value="minutes">minutes</option>
+          <option value="heures" selected>heures</option>
+          <option value="jours">jours</option>
+        </select>
+        <span class="hint">les envois sont étalés sur cette durée, à intervalles
+          irréguliers — vide = tout d'affilée</span>
+      </div>
+
+      <label for="quiet-start">Plage horaire</label>
+      <div class="row">
+        <input id="quiet-start" type="time" value="08:00" class="narrow">
+        <label for="quiet-end" class="inline">à</label>
+        <input id="quiet-end" type="time" value="20:00" class="narrow">
+        <span class="hint">hors de cette plage la campagne se met en pause
+          jusqu'au lendemain</span>
+      </div>
+
       <label for="smtp-host">Serveur SMTP</label>
       <div class="row">
         <input id="smtp-host" type="text" placeholder="détecté automatiquement">
@@ -88,12 +117,15 @@
 
   <div class="actions">
     <button id="btn-dry" type="button" class="ghost">Simuler</button>
+    <button id="btn-pause" type="button" class="ghost" hidden>Pause</button>
+    <button id="btn-stop" type="button" class="ghost danger" hidden>Arrêter</button>
     <button id="btn-send" type="button" class="primary">Envoyer</button>
   </div>
 
   <section id="log-panel">
     <div class="panel-head">
       <strong>Journal</strong>
+      <span class="hint" id="progress" hidden></span>
       <button id="btn-log-clear" type="button" class="ghost small">Vider</button>
     </div>
     <div id="log"></div>
