@@ -180,6 +180,72 @@ def planifier(cfg):
     return sm.gaps(len(cfg["lots"]), cfg["duree"]) if cfg["duree"] else []
 
 
+def _resume_campagne(cfg):
+    """Chiffres et avertissements d'une campagne.
+
+    Partage entre la simulation et la confirmation d'envoi : les deux doivent
+    annoncer exactement les memes quotas, la meme cadence et les memes exclus.
+    Les regles restent ici, cote Python — app.js ne fait que les mettre en
+    forme."""
+    n = len(cfg["lots"])
+    destinataires = sum(len(lot) for lot in cfg["lots"])
+    duree = cfg["duree"]
+    # Moyenne des ecarts reellement planifies, et non une reconstitution de la
+    # formule : c'est ce que le worker appliquera.
+    ecarts = planifier(cfg)
+    ecart_moyen = sum(ecarts) / len(ecarts) if ecarts else 0.0
+
+    avertissements = []
+    quota = QUOTAS.get((cfg["sender"] or "").rsplit("@", 1)[-1].lower())
+    if quota:
+        # Le quota se compte en DESTINATAIRES, pas en messages : grouper 577
+        # adresses en 12 envois n'en consomme pas 12 mais 577. Compter les lots
+        # ici laisserait passer sans un mot une campagne groupee tres au-dessus
+        # de la limite.
+        jours = max(duree / 86400.0, 0.0)
+        par_jour = destinataires / jours if jours >= 1 else destinataires
+        if par_jour > quota:
+            avertissements.append(
+                f"{destinataires} destinataires depassent le quota de "
+                f"{quota}/jour de ce fournisseur" +
+                (f" ({par_jour:.0f}/jour au rythme prevu)" if jours >= 1 else "") +
+                " — le quota se compte par destinataire, meme groupes dans un "
+                "seul message. Au-dela, les envois sont rejetes et le compte "
+                "suspendu 24 h.")
+    if n < 2:
+        pass          # un seul message : ni cadence ni etalement a commenter
+    elif not duree:
+        avertissements.append(
+            "aucune duree de campagne : les messages partiront a la suite, "
+            "sans pause — c'est exactement ce qui fait bloquer un compte.")
+    elif ecart_moyen < 20:
+        avertissements.append(
+            f"cadence rapide : un message toutes les {ecart_moyen:.0f} s en "
+            f"moyenne. Allonger la duree reduit le risque de blocage.")
+    if sm.has_placeholders(cfg["subject"] or ""):
+        avertissements.append(
+            "l'objet contient un placeholder ({{...}}) : il n'est pas "
+            "personnalise et partira tel quel.")
+    if cfg["partagees"]:
+        avertissements.append(
+            f"{len(cfg['partagees'])} adresse(s) designent plusieurs deputes "
+            f"dans le CSV : l'un d'eux ne sera pas contacte "
+            f"({', '.join(cfg['partagees'])}).")
+
+    return {
+        "messages": n,
+        "destinataires": destinataires,
+        "grouped": n != destinataires,
+        "objets": len(cfg["subjects"]),
+        "duree": duree,
+        "ecartMoyen": ecart_moyen,
+        "plage": list(cfg["plage"]) if cfg["plage"] else None,
+        "excluded": cfg["exclus"],
+        "warnings": avertissements,
+        "ecarts": ecarts,
+    }
+
+
 def _prochaine_ouverture(ts, plage):
     """Avance `ts` jusqu'a la prochaine minute autorisee par la plage."""
     if not plage:
@@ -307,17 +373,25 @@ class Api:
         except Exception:
             pass  # fenetre fermee pendant un envoi
 
-    def _prepare(self, p, melanger=False):
+    def _prepare(self, p, melanger=False, reseau=True):
         """Valide les champs et construit la config d'envoi.
 
-        `melanger` n'est vrai que pour un envoi reel : dry_run et preflight
-        doivent rester reproductibles d'un clic a l'autre (meme ordre, meme
-        apercu), et en mode groupe un melange changerait la composition des
-        lots entre ce qui est annonce et ce qui part.
+        `melanger` n'est vrai que pour un envoi reel : la simulation et le
+        preflight doivent rester reproductibles d'un clic a l'autre (meme
+        ordre, meme apercu), et en mode groupe un melange changerait la
+        composition des lots entre ce qui est annonce et ce qui part.
+
+        `reseau=False` : planification seule (bouton Simuler). Ce qui ne sert
+        qu'a l'envoi — expediteur, objet, corps — devient facultatif, et le
+        serveur SMTP n'est pas resolu : resolve_smtp() ouvre de vraies
+        connexions de test, or on veut pouvoir verifier un calendrier avec la
+        seule liste de destinataires, sans reseau ni identifiants.
 
         Leve ValueError (champ invalide) ou sm.SendMailError (domaine SMTP)."""
         sender = (p.get("sender") or "").strip()
-        if not sm.ADDR_RE.match(sender):
+        # Un expediteur saisi mais errone reste une erreur, meme en mode
+        # planification : le signaler tot vaut mieux qu'au moment d'envoyer.
+        if (reseau or sender) and not sm.ADDR_RE.match(sender):
             raise ValueError(f"adresse expeditrice invalide : {sender or '(vide)'}")
 
         # Chaque ligne vaut "adresse" ou "adresse,T" (T = H/M/F, casse libre).
@@ -354,13 +428,18 @@ class Api:
         subjects = [s.strip() for s in (p.get("subjects") or []) if s.strip()]
         if not subjects:
             unique = (p.get("subject") or "").strip()
-            if not unique:
+            if not unique and reseau:
                 raise ValueError("objet manquant")
-            subjects = [unique]
-        subject = subjects[0]
+            subjects = [unique] if unique else []
+        subject = subjects[0] if subjects else ""
 
+        # Un editeur Quill vide rend "<p><br></p>", que .strip() juge non vide :
+        # jusqu'ici un corps HTML vierge passait donc la validation et partait
+        # tel quel. On juge sur le texte rendu.
         body = p.get("body") or ""
-        if not body.strip():
+        is_html = bool(p.get("isHtml"))
+        corps_vide = not (sm.html_to_text(body) if is_html else body).strip()
+        if corps_vide and reseau:
             raise ValueError("corps du mail vide")
 
         group = bool(p.get("group"))
@@ -393,8 +472,14 @@ class Api:
             if not 1 <= port <= 65535:
                 raise ValueError("port SMTP invalide")
 
-        host, resolved_port = sm.resolve_smtp(
-            sender, (p.get("smtpHost") or "").strip() or None, port)
+        # resolve_smtp() ouvre de vraies connexions de test pour deviner le
+        # serveur : la planification seule n'en a pas besoin et ne doit pas
+        # attendre le reseau.
+        if reseau:
+            host, resolved_port = sm.resolve_smtp(
+                sender, (p.get("smtpHost") or "").strip() or None, port)
+        else:
+            host, resolved_port = None, port
 
         # Un titre ecrit sur la ligne prime sur le CSV des deputes : c'est un
         # choix explicite et visible de l'utilisateur. Le CSV reste le repli
@@ -435,7 +520,7 @@ class Api:
         return {
             "sender": sender, "host": host, "port": resolved_port,
             "subject": subject, "subjects": subjects, "body": body,
-            "is_html": bool(p.get("isHtml")), "lots": lots,
+            "is_html": is_html, "corps_vide": corps_vide, "lots": lots,
             "genres": genres, "noms": noms, "sans_genre": len(exclus),
             "exclus": exclus,
             "partagees": [a for a in partagees if a in vues],
@@ -500,59 +585,9 @@ class Api:
         except (ValueError, sm.SendMailError) as e:
             return {"error": str(e)}
 
-        n = len(cfg["lots"])
-        destinataires = sum(len(lot) for lot in cfg["lots"])
-        duree = cfg["duree"]
-        # Moyenne des ecarts reellement planifies, et non une reconstitution
-        # de la formule : c'est ce que le worker appliquera.
-        ecarts = planifier(cfg)
-        ecart_moyen = sum(ecarts) / len(ecarts) if ecarts else 0.0
-
-        avertissements = []
-        quota = QUOTAS.get(cfg["sender"].rsplit("@", 1)[-1].lower())
-        if quota:
-            # Le quota se compte en DESTINATAIRES, pas en messages : grouper
-            # 577 adresses en 12 envois n'en consomme pas 12 mais 577. Compter
-            # les lots ici laisserait passer sans un mot une campagne groupee
-            # tres au-dessus de la limite.
-            jours = max(duree / 86400.0, 0.0)
-            par_jour = destinataires / jours if jours >= 1 else destinataires
-            if par_jour > quota:
-                avertissements.append(
-                    f"{destinataires} destinataires depassent le quota de "
-                    f"{quota}/jour de ce fournisseur" +
-                    (f" ({par_jour:.0f}/jour au rythme prevu)" if jours >= 1 else "") +
-                    " — le quota se compte par destinataire, meme groupes dans "
-                    "un seul message. Au-dela, les envois sont rejetes et le "
-                    "compte suspendu 24 h.")
-        if not duree:
-            avertissements.append(
-                "aucune duree de campagne : les messages partiront a la suite, "
-                "sans pause — c'est exactement ce qui fait bloquer un compte.")
-        elif ecart_moyen < 20:
-            avertissements.append(
-                f"cadence rapide : un message toutes les {ecart_moyen:.0f} s en "
-                f"moyenne. Allonger la duree reduit le risque de blocage.")
-        if sm.has_placeholders(cfg["subject"]):
-            avertissements.append(
-                "l'objet contient un placeholder ({{...}}) : il n'est pas "
-                "personnalise et partira tel quel.")
-        if cfg["partagees"]:
-            avertissements.append(
-                f"{len(cfg['partagees'])} adresse(s) designent plusieurs deputes "
-                f"dans le CSV : l'un d'eux ne sera pas contacte "
-                f"({', '.join(cfg['partagees'])}).")
-
-        return {
-            "messages": n,
-            "destinataires": destinataires,
-            "objets": len(cfg["subjects"]),
-            "duree": duree,
-            "ecartMoyen": ecart_moyen,
-            "plage": list(cfg["plage"]) if cfg["plage"] else None,
-            "excluded": cfg["exclus"],
-            "warnings": avertissements,
-        }
+        resume = _resume_campagne(cfg)
+        resume.pop("ecarts")   # detail interne, inutile a la page
+        return resume
 
     def cancel(self):
         """Arrete la campagne en cours : elle s'interrompt entre deux messages
@@ -569,18 +604,69 @@ class Api:
         self._pause.clear()
         return {"ok": True}
 
-    def dry_run(self, p):
-        """Simule : resout le serveur, verifie reellement l'authentification
-        (connexion + login, sans envoyer aucun mail — la session est fermee
-        aussitot), construit les lots, rend le corps personnalise pour le
-        premier destinataire. Un mot de passe errone est ainsi detecte avant
-        un envoi reel, pas pendant."""
-        # dry_run et le worker echangent tous deux sys.stderr, qui est global :
-        # lancer une simulation pendant une campagne ferait restaurer par le
-        # finally d'ici le relais du worker, definitivement, et tout ce que la
-        # bibliotheque ecrit ensuite disparaitrait du journal.
+    def simulate(self, p):
+        """Calendrier previsionnel de la campagne, sans toucher au reseau.
+
+        Ne demande que les destinataires : expediteur, objet, corps et mot de
+        passe restent facultatifs, et sont simplement rapportes comme manquants
+        (`manques`). Verifier un calendrier ne devrait pas exiger d'avoir deja
+        redige le message ni sorti ses identifiants.
+
+        La verification d'authentification, elle, vit dans check_auth() : la
+        page appelle les deux a la suite, de sorte que le calendrier s'affiche
+        immediatement et que l'attente reseau vienne apres."""
         if self._sending:
             return {"error": "une campagne est en cours — arrete-la avant de simuler"}
+        try:
+            cfg = self._prepare(p, reseau=False)
+        except (ValueError, sm.SendMailError) as e:
+            return {"error": str(e)}
+
+        # Le calendrier est rejoue avec les memes fonctions que l'envoi reel
+        # (planifier + plage horaire), donc sur le nombre de LOTS : en mode
+        # groupe un lot part en un seul message et c'est lui qui est cadence.
+        resume = _resume_campagne(cfg)
+        lots = cfg["lots"]
+        horaires = formate_horaires(horaires_previsionnels(
+            time.time(), resume.pop("ecarts"), cfg["plage"], len(lots)))
+
+        corps = cfg["body"]
+        personnalise = bool(corps) and sm.has_placeholders(corps)
+        if personnalise:
+            premier = lots[0][0]
+            cle = premier.lower()
+            corps = sm.personalize(corps, premier, cfg["genres"].get(cle),
+                                   cfg["noms"].get(cle))
+
+        manques = []
+        if not (p.get("sender") or "").strip():
+            manques.append("expéditeur")
+        if not cfg["subjects"]:
+            manques.append("objet")
+        if cfg["corps_vide"]:
+            manques.append("corps")
+        if not "".join((p.get("password") or "").split()):
+            manques.append("mot de passe")
+
+        return dict(resume,
+                    lots=[list(lot) for lot in lots],
+                    schedule=horaires,
+                    fin=horaires[-1] if horaires else None,
+                    body=corps,
+                    personalizedFor=lots[0][0] if personnalise else None,
+                    isHtml=cfg["is_html"],
+                    manques=manques)
+
+    def check_auth(self, p):
+        """Verifie les identifiants SMTP : resolution du serveur, connexion et
+        login, puis deconnexion immediate — aucun mail n'est envoye. Separe de
+        simulate() pour que le calendrier s'affiche sans attendre le reseau."""
+        if self._sending:
+            return {"error": "une campagne est en cours"}
+        # check_auth et le worker echangent tous deux sys.stderr, qui est
+        # global : lancer une verification pendant une campagne ferait
+        # restaurer ici le relais du worker, definitivement, et tout ce que la
+        # bibliotheque ecrit ensuite disparaitrait du journal.
         relay = _StderrRelay(lambda ligne: self._emit("log", ligne))
         ancien, sys.stderr = sys.stderr, relay
         try:
@@ -607,34 +693,7 @@ class Api:
                 pass
         finally:
             sys.stderr = ancien
-
-        premier = cfg["lots"][0][0]
-        corps = cfg["body"]
-        personnalise = sm.has_placeholders(corps)
-        if personnalise:
-            cle = premier.lower()
-            corps = sm.personalize(corps, premier, cfg["genres"].get(cle),
-                                   cfg["noms"].get(cle))
-        # Le calendrier est rejoue avec les memes fonctions que l'envoi reel
-        # (gaps + plage horaire), sur le nombre de LOTS et non de destinataires :
-        # en mode groupe, un lot part en un seul message et c'est lui qui est
-        # cadence. Sans ca, la simulation annoncerait un calendrier que l'envoi
-        # ne suivrait pas.
-        lots = cfg["lots"]
-        ecarts = planifier(cfg)
-        horaires = horaires_previsionnels(time.time(), ecarts, cfg["plage"],
-                                          len(lots))
-        return {
-            "host": cfg["host"], "port": cfg["port"],
-            "lots": [list(lot) for lot in lots],
-            "schedule": formate_horaires(horaires),
-            "fin": formate_horaires(horaires)[-1] if horaires else None,
-            "grouped": len(lots) != sum(len(l) for l in lots),
-            "destinataires": sum(len(l) for l in lots),
-            "body": corps, "personalizedFor": premier if personnalise else None,
-            "isHtml": cfg["is_html"], "missingGender": cfg["sans_genre"],
-            "excluded": cfg["exclus"],
-        }
+        return {"host": cfg["host"], "port": cfg["port"]}
 
     def send(self, p):
         """Lance l'envoi dans un thread ; la progression revient par

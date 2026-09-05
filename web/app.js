@@ -354,22 +354,18 @@ async function loadDeputies() {
     `filtrer la liste`, "line-muted");
 }
 
+// Simuler en deux temps : le calendrier d'abord, sans réseau, pour qu'il
+// s'affiche immédiatement et avec les seuls destinataires ; l'authentification
+// ensuite, seulement si expéditeur et mot de passe sont renseignés.
 async function dryRun() {
-  // dry_run verifie une vraie authentification (connexion + login, fermee
-  // aussitot) : un mot de passe est donc requis ici aussi, pas seulement
-  // pour Envoyer.
-  const res = await window.pywebview.api.dry_run(collect());
+  const p = collect();
+  const res = await window.pywebview.api.simulate(p);
   if (res.error) { log(res.error, "line-err"); return; }
 
-  // Deux faits distincts, sur deux lignes : accolés avec un tiret, le format
-  // du corps se lisait comme s'il qualifiait l'authentification.
-  log(`[simulation] authentification vérifiée sur ${res.host}:${res.port}`, "line-ok");
-  log(`  corps envoyé en ${res.isHtml ? "HTML" : "texte brut"}`, "line-muted");
-
   const groupe = res.grouped;
-  log(`  ${res.lots.length} message${res.lots.length > 1 ? "s" : ""} pour ` +
-    `${res.destinataires} destinataire${res.destinataires > 1 ? "s" : ""}` +
-    (groupe ? ` (groupés — tous ceux d'un lot se voient en To)` : ""), "line-muted");
+  log(`[simulation] ${res.lots.length} message${res.lots.length > 1 ? "s" : ""} ` +
+    `pour ${res.destinataires} destinataire${res.destinataires > 1 ? "s" : ""}` +
+    (groupe ? " (groupés — tous ceux d'un lot se voient en To)" : ""), "line-ok");
 
   res.lots.forEach((lot, i) => {
     const h = res.schedule && res.schedule[i] ? `${res.schedule[i]}  ` : "";
@@ -385,9 +381,23 @@ async function dryRun() {
   }
 
   if (res.personalizedFor) {
-    log(`  corps personnalisé pour ${res.personalizedFor}`, "line-muted");
+    log(`  corps ${res.isHtml ? "HTML" : "texte brut"}, personnalisé pour ` +
+      `${res.personalizedFor}`, "line-muted");
   }
   logExcluded(res.excluded);
+  (res.warnings || []).forEach((w) => log(`  ⚠ ${w}`, "line-err"));
+
+  if (res.manques && res.manques.length) {
+    log(`  il manquera ${res.manques.join(", ")} pour envoyer réellement`,
+      "line-muted");
+  }
+
+  // Pas d'identifiants : on s'arrête au calendrier, ce n'est pas une erreur.
+  if (res.manques.includes("expéditeur") || res.manques.includes("mot de passe")) return;
+
+  const auth = await window.pywebview.api.check_auth(p);
+  if (auth.error) { log(auth.error, "line-err"); return; }
+  log(`  authentification vérifiée sur ${auth.host}:${auth.port}`, "line-ok");
 }
 
 // Un destinataire dont on ne connait ni le nom ni le genre n'est plus envoye
