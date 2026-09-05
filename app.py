@@ -277,15 +277,35 @@ def horaires_previsionnels(depart, ecarts, plage, nb, cout_envoi=sm.COUT_ENVOI):
     return horaires
 
 
+# Noms de jours en dur : la locale du systeme n'est pas garantie (elle est
+# vide ici, et strftime("%A") rendrait "Saturday"), et elle varie d'une
+# machine a l'autre — sur Windows notamment.
+JOURS_FR = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+
+
+def _libelle_jour(ts):
+    lt = time.localtime(ts)
+    return f"{JOURS_FR[lt.tm_wday]} {lt.tm_mday:02d}/{lt.tm_mon:02d}"
+
+
 def formate_horaires(horaires):
-    """Horaires en texte court : l'heure seule tant qu'on reste le meme jour,
-    la date des que la campagne deborde sur le lendemain."""
+    """(heures, jours) pour affichage.
+
+    `heures[i]` est toujours "HH:MM" en 24 h — les colonnes restent alignees.
+    `jours[i]` ne porte un libelle que lorsque l'envoi i ouvre un jour
+    different du precedent : la page intercale alors un separateur, plutot que
+    de repeter la date sur chaque ligne et de desaligner la moitie de la
+    liste. Le premier envoi n'est etiquete que s'il n'a pas lieu aujourd'hui."""
     if not horaires:
-        return []
-    jour0 = time.localtime(horaires[0]).tm_yday
-    return [time.strftime("%H:%M" if time.localtime(t).tm_yday == jour0
-                          else "%d/%m %H:%M", time.localtime(t))
-            for t in horaires]
+        return [], []
+    heures = [time.strftime("%H:%M", time.localtime(t)) for t in horaires]
+
+    jours, precedent = [], time.localtime().tm_yday
+    for t in horaires:
+        jour = time.localtime(t).tm_yday
+        jours.append(_libelle_jour(t) if jour != precedent else "")
+        precedent = jour
+    return heures, jours
 
 
 def dans_plage(plage, maintenant=None):
@@ -627,8 +647,15 @@ class Api:
         # groupe un lot part en un seul message et c'est lui qui est cadence.
         resume = _resume_campagne(cfg)
         lots = cfg["lots"]
-        horaires = formate_horaires(horaires_previsionnels(
-            time.time(), resume.pop("ecarts"), cfg["plage"], len(lots)))
+        instants = horaires_previsionnels(time.time(), resume.pop("ecarts"),
+                                          cfg["plage"], len(lots))
+        heures, jours = formate_horaires(instants)
+        # La derniere ligne porte le jour si la campagne deborde d'aujourd'hui.
+        fin = None
+        if instants:
+            dernier = instants[-1]
+            meme_jour = time.localtime(dernier).tm_yday == time.localtime().tm_yday
+            fin = heures[-1] if meme_jour else f"{_libelle_jour(dernier)} à {heures[-1]}"
 
         corps = cfg["body"]
         personnalise = bool(corps) and sm.has_placeholders(corps)
@@ -650,8 +677,9 @@ class Api:
 
         return dict(resume,
                     lots=[list(lot) for lot in lots],
-                    schedule=horaires,
-                    fin=horaires[-1] if horaires else None,
+                    schedule=heures,
+                    days=jours,
+                    fin=fin,
                     body=corps,
                     personalizedFor=lots[0][0] if personnalise else None,
                     isHtml=cfg["is_html"],

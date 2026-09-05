@@ -368,6 +368,9 @@ async function dryRun() {
     (groupe ? " (groupés — tous ceux d'un lot se voient en To)" : ""), "line-ok");
 
   res.lots.forEach((lot, i) => {
+    // Un séparateur au changement de jour, plutôt que la date répétée sur
+    // chaque ligne : les heures restent alignées en colonne.
+    if (res.days && res.days[i]) log(`  ── ${res.days[i]} ──`, "line-muted");
     const h = res.schedule && res.schedule[i] ? `${res.schedule[i]}  ` : "";
     log(`  ${h}-> ${lot.join(", ")}`, "line-muted");
   });
