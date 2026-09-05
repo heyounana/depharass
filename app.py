@@ -202,6 +202,12 @@ def _resume_campagne(cfg):
         # adresses en 12 envois n'en consomme pas 12 mais 577. Compter les lots
         # ici laisserait passer sans un mot une campagne groupee tres au-dessus
         # de la limite.
+        #
+        # La valeur (500/jour) vient de la seule page officielle Gmail sur le
+        # sujet (support.google.com/mail/answer/22839), qui ne distingue pas
+        # webmail et client SMTP — donc potentiellement optimiste pour un envoi
+        # scripte comme celui-ci, sans qu'on ait de chiffre distinct a citer.
+        # A ne pas durcir sans nouvelle source.
         jours = max(duree / 86400.0, 0.0)
         par_jour = destinataires / jours if jours >= 1 else destinataires
         if par_jour > quota:
@@ -210,8 +216,9 @@ def _resume_campagne(cfg):
                 f"{quota}/jour de ce fournisseur" +
                 (f" ({par_jour:.0f}/jour au rythme prevu)" if jours >= 1 else "") +
                 " — le quota se compte par destinataire, meme groupes dans un "
-                "seul message. Au-dela, les envois sont rejetes et le compte "
-                "suspendu 24 h.")
+                "seul message. Au-dela, Google bloque l'envoi et indique un "
+                "delai de 1 a 24 h avant de pouvoir reessayer (pas une duree "
+                "garantie).")
     if n < 2:
         pass          # un seul message : ni cadence ni etalement a commenter
     elif not duree:
