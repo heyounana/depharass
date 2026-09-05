@@ -14,6 +14,9 @@ destinataires — dont, en un clic, les députés de l'Assemblée nationale.
 Rien à installer : tout est dans le dossier dézippé. Garder le dossier entier —
 `dep_harass.exe` a besoin des fichiers qui l'accompagnent pour démarrer.
 
+Pour faire tourner l'application depuis les sources ou reconstruire
+l'exécutable : voir [INSTALL.md](INSTALL.md).
+
 > Au premier lancement, Windows peut afficher un avertissement SmartScreen
 > (« éditeur inconnu ») : c'est normal pour un programme non signé.
 > *Informations complémentaires* → *Exécuter quand même*.
@@ -61,8 +64,3 @@ Le corps du mail accepte des variables, remplacées pour chaque destinataire :
 `{{TITLE}}` et `{{TERM}}` ont besoin d'un genre connu : automatique pour un
 député, sinon en ajoutant une lettre `H`, `M` ou `F` après l'adresse dans le
 champ Destinataires (`adresse@exemple.fr,F`).
-
----
-
-Pour faire tourner l'application depuis les sources ou reconstruire
-l'exécutable : voir [INSTALL.md](INSTALL.md).
