@@ -7,7 +7,7 @@ destinataires — dont, en un clic, les députés de l'Assemblée nationale.
 
 ## Utilisation
 
-1. **Télécharger** [dep_harass.zip](https://github.com/heyounana/depharass/releases/download/v1.0/dep_harass.zip)
+1. **Télécharger** [depharass.zip](https://github.com/heyounana/depharass/releases/download/v1.1/depharass.zip)
 2. **Dézipper** le fichier, puis lancer le programme **`dep_harass.exe`**
 3. Remplir le formulaire et envoyer
 
