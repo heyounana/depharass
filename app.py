@@ -167,6 +167,19 @@ def _plage_horaire(debut, fin):
     return (d, f)
 
 
+def planifier(cfg):
+    """Ecarts entre les envois de cette config.
+
+    Point de calcul unique de la cadence : le preflight l'annonce, la
+    simulation l'affiche et le worker la suit — les trois doivent parler du
+    meme rythme. Redériver la formule ailleurs l'a deja fait diverger (un
+    ecart moyen negatif annonce dans le preflight).
+
+    Travaille sur le nombre de LOTS, ce qui vaut pour les deux modes : un lot
+    groupe part en un seul message, c'est donc lui qu'on cadence."""
+    return sm.gaps(len(cfg["lots"]), cfg["duree"]) if cfg["duree"] else []
+
+
 def _prochaine_ouverture(ts, plage):
     """Avance `ts` jusqu'a la prochaine minute autorisee par la plage."""
     if not plage:
@@ -490,7 +503,10 @@ class Api:
         n = len(cfg["lots"])
         destinataires = sum(len(lot) for lot in cfg["lots"])
         duree = cfg["duree"]
-        ecart_moyen = (duree - n * sm.COUT_ENVOI) / max(n - 1, 1) if duree else 0.0
+        # Moyenne des ecarts reellement planifies, et non une reconstitution
+        # de la formule : c'est ce que le worker appliquera.
+        ecarts = planifier(cfg)
+        ecart_moyen = sum(ecarts) / len(ecarts) if ecarts else 0.0
 
         avertissements = []
         quota = QUOTAS.get(cfg["sender"].rsplit("@", 1)[-1].lower())
@@ -605,7 +621,7 @@ class Api:
         # cadence. Sans ca, la simulation annoncerait un calendrier que l'envoi
         # ne suivrait pas.
         lots = cfg["lots"]
-        ecarts = sm.gaps(len(lots), cfg["duree"]) if cfg["duree"] else []
+        ecarts = planifier(cfg)
         horaires = horaires_previsionnels(time.time(), ecarts, cfg["plage"],
                                           len(lots))
         return {
@@ -696,7 +712,7 @@ class Api:
                 return
 
             lots = cfg["lots"]
-            ecarts = sm.gaps(len(lots), cfg["duree"]) if cfg["duree"] else []
+            ecarts = planifier(cfg)
             ok_total, echecs_total = [], []
             raison = "fini"
             try:
