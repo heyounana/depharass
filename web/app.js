@@ -181,9 +181,31 @@ function addSubject() {
   refreshSubjects();
 }
 
+// La durée par défaut suit le nombre de destinataires, à raison d'une minute
+// par message : une valeur fixe ne veut rien dire, 6 h étant confortable pour
+// 50 adresses et bien trop serré pour 577. Dès que l'utilisateur touche au
+// champ, on cesse de le réécrire — sa valeur ne doit pas sauter sous ses yeux.
+let dureeModifiee = false;
+
+function majDureeParDefaut(n) {
+  if (dureeModifiee || !n) return;
+  const minutes = n;                       // 1 min par message
+  let valeur = minutes, unite = "minutes";
+  if (minutes >= 2880) {                   // au-delà de 48 h, en jours
+    valeur = Math.round((minutes / 1440) * 10) / 10;
+    unite = "jours";
+  } else if (minutes >= 90) {              // au-delà d'1 h 30, en heures
+    valeur = Math.round((minutes / 60) * 10) / 10;
+    unite = "heures";
+  }
+  $("duration-value").value = valeur;
+  $("duration-unit").value = unite;
+}
+
 function refreshCount() {
   const n = $("dests").value.split("\n").map((s) => s.trim()).filter(Boolean).length;
   $("dests-count").textContent = n ? `${n} adresse${n > 1 ? "s" : ""}` : "";
+  majDureeParDefaut(n);
 }
 
 // -------------------------------------------------------------------- mode
@@ -387,7 +409,7 @@ async function dryRun() {
     log(`  corps ${res.isHtml ? "HTML" : "texte brut"}, personnalisé pour ` +
       `${res.personalizedFor}`, "line-muted");
   }
-  logExcluded(res.excluded);
+  logApproximations(res.approximations);
   (res.warnings || []).forEach((w) => log(`  ⚠ ${w}`, "line-err"));
 
   if (res.manques && res.manques.length) {
@@ -407,11 +429,12 @@ async function dryRun() {
 // avec des blancs a la place ("Bonjour  Dupont") : il est ecarte en amont par
 // Python et rapporte ici. Les exclus peuvent etre des centaines, donc le
 // detail va dans le journal et seul le compte tient dans la confirmation.
-function logExcluded(exclus) {
-  if (!exclus || !exclus.length) return;
-  log(`  ${exclus.length} destinataire(s) écarté(s), faute de quoi le message ` +
-    `serait envoyé avec un blanc à la place du nom :`, "line-err");
-  exclus.forEach((e) => log(`     ${e.addr} — ${e.raison}`, "line-err"));
+function logApproximations(approx) {
+  if (!approx || !approx.length) return;
+  // Avertissement, pas erreur : l'envoi part quand même. Le détail permet de
+  // corriger avant (",F" sur la ligne pour le genre, nom saisi à la main).
+  log(`  ${approx.length} approximation(s) — l'envoi reste possible :`, "line-warn");
+  approx.forEach((e) => log(`     ${e.addr} — ${e.raison}`, "line-warn"));
 }
 
 function dureeLisible(s) {
@@ -466,7 +489,7 @@ async function send() {
   }
   if (pre.error) { log(pre.error, "line-err"); return; }
 
-  logExcluded(pre.excluded);
+  logApproximations(pre.approximations);
 
   const lignes = [`Envoyer ${pre.messages} message${pre.messages > 1 ? "s" : ""} ` +
                   `à ${pre.destinataires} destinataire${pre.destinataires > 1 ? "s" : ""} ?`];
@@ -479,8 +502,9 @@ async function send() {
     lignes.push(`Envois entre ${hh(pre.plage[0])} et ${hh(pre.plage[1])} seulement.`);
   }
   if (pre.objets > 1) lignes.push(`${pre.objets} objets alternés.`);
-  if (pre.excluded.length) {
-    lignes.push(`${pre.excluded.length} adresse(s) écartée(s) — détail dans le journal.`);
+  if (pre.approximations.length) {
+    lignes.push(`${pre.approximations.length} approximation(s) de nom ou de genre ` +
+                `— détail dans le journal.`);
   }
   if (pre.warnings.length) lignes.push("", ...pre.warnings.map((w) => "⚠ " + w));
 
@@ -521,6 +545,12 @@ function wire() {
   $("btn-pause").addEventListener("click", togglePause);
   $("btn-stop").addEventListener("click", stopCampaign);
   $("btn-subject-add").addEventListener("click", addSubject);
+
+  // Une modification manuelle fige la durée : elle cesse de suivre le nombre
+  // de destinataires.
+  ["duration-value", "duration-unit"].forEach((id) => {
+    $(id).addEventListener("input", () => { dureeModifiee = true; });
+  });
   $("btn-log-clear").addEventListener("click", () => { $("log").innerHTML = ""; });
 
   $("body-text").placeholder = BODY_PLACEHOLDER;

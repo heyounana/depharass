@@ -7,6 +7,7 @@
   --accent: #1a73e8;
   --ok: #1a7f37;
   --err: #b42318;
+  --warn: #b45309;   /* orange : signale sans interdire */
 }
 
 * { box-sizing: border-box; }
@@ -559,4 +560,6 @@ section {
 
 .line-ok { color: var(--ok); }
 .line-err { color: var(--err); }
+/* Approximations : l'envoi reste possible, ce n'est pas une erreur. */
+.line-warn { color: var(--warn); }
 .line-muted { color: var(--muted); }

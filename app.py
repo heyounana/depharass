@@ -184,7 +184,7 @@ def _resume_campagne(cfg):
     """Chiffres et avertissements d'une campagne.
 
     Partage entre la simulation et la confirmation d'envoi : les deux doivent
-    annoncer exactement les memes quotas, la meme cadence et les memes exclus.
+    annoncer exactement les memes quotas, la meme cadence et les memes replis.
     Les regles restent ici, cote Python — app.js ne fait que les mettre en
     forme."""
     n = len(cfg["lots"])
@@ -240,7 +240,7 @@ def _resume_campagne(cfg):
         "duree": duree,
         "ecartMoyen": ecart_moyen,
         "plage": list(cfg["plage"]) if cfg["plage"] else None,
-        "excluded": cfg["exclus"],
+        "approximations": cfg["approximations"],
         "warnings": avertissements,
         "ecarts": ecarts,
     }
@@ -508,28 +508,26 @@ class Api:
         genres = {**_deputy_genders(), **titres_lignes}
         noms, partagees = _deputy_names()
 
-        # Un destinataire n'est retenu que si le corps peut etre rendu
-        # entierement pour lui : un {{LAST}} laisse vide expedierait
-        # "Bonjour  ," — precisement le marqueur qu'on cherche a supprimer.
-        # (Le mode groupe ne passe jamais ici : il refuse deja tout placeholder
-        # plus haut.)
-        exclus = []
+        # Personne n'est ecarte : un nom ou un genre inconnu se rattrape par un
+        # repli (partie locale de l'adresse, masculin par defaut) et se signale
+        # a l'utilisateur, sans bloquer l'envoi. Le repli reste visible dans le
+        # journal pour qu'il puisse corriger — en ajoutant ",F" sur la ligne
+        # pour le genre, ou en editant le nom a la main.
+        approximations = []
         if sm.has_name_placeholders(body) or sm.has_gender_placeholders(body):
-            retenus = []
             for d in dests:
                 cle = d.lower()
-                if sm.has_name_placeholders(body) and not sm.resolve_names(d, noms)[1]:
-                    exclus.append({"addr": d, "raison": "nom introuvable"})
-                elif sm.has_gender_placeholders(body) and cle not in genres:
-                    exclus.append({"addr": d, "raison": "genre inconnu"})
-                else:
-                    retenus.append(d)
-            dests = retenus
-            if not dests:
-                raise ValueError(
-                    f"aucun destinataire exploitable : les {len(exclus)} adresses "
-                    f"saisies n'ont ni nom ni genre identifiable, alors que le "
-                    f"corps utilise des placeholders")
+                if sm.has_name_placeholders(body) and not sm.nom_fiable(d, noms):
+                    prenom, nom = sm.resolve_names(d, noms)
+                    approximations.append({
+                        "addr": d,
+                        "raison": f"nom deduit de l'adresse : {nom.upper()}"})
+                if sm.has_gender_placeholders(body) and cle not in genres:
+                    genres[cle] = "M"
+                    approximations.append({
+                        "addr": d,
+                        "raison": "genre inconnu, masculin par defaut "
+                                  "(ajoute \",F\" sur la ligne pour corriger)"})
 
         if melanger:
             random.shuffle(dests)
@@ -541,8 +539,8 @@ class Api:
             "sender": sender, "host": host, "port": resolved_port,
             "subject": subject, "subjects": subjects, "body": body,
             "is_html": is_html, "corps_vide": corps_vide, "lots": lots,
-            "genres": genres, "noms": noms, "sans_genre": len(exclus),
-            "exclus": exclus,
+            "genres": genres, "noms": noms,
+            "approximations": approximations,
             "partagees": [a for a in partagees if a in vues],
             "duree": _duree_secondes(p.get("durationValue"), p.get("durationUnit")),
             "plage": _plage_horaire(p.get("quietStart"), p.get("quietEnd")),
@@ -597,7 +595,7 @@ class Api:
     def preflight(self, p):
         """Ce que l'utilisateur doit savoir avant de confirmer un envoi.
 
-        Calcule ici et non dans la page : quotas, cadence et exclusions sont
+        Calcule ici et non dans la page : quotas, cadence et replis sont
         des regles metier, et app.js n'en duplique aucune. La page se contente
         de mettre en forme ce qui est renvoye ici."""
         try:
@@ -749,8 +747,7 @@ class Api:
         return {"started": True,
                 "lots": len(cfg["lots"]),
                 "dests": sum(len(lot) for lot in cfg["lots"]),
-                "missingGender": cfg["sans_genre"],
-                "excluded": cfg["exclus"]}
+                "approximations": cfg["approximations"]}
 
     # ---------------------------------------------------- thread d'envoi
 
