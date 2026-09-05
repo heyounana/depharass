@@ -167,6 +167,48 @@ def _plage_horaire(debut, fin):
     return (d, f)
 
 
+def _prochaine_ouverture(ts, plage):
+    """Avance `ts` jusqu'a la prochaine minute autorisee par la plage."""
+    if not plage:
+        return ts
+    debut = plage[0]
+    for _ in range(8):   # au pire quelques sauts de jour
+        lt = time.localtime(ts)
+        if dans_plage(plage, lt.tm_hour * 60 + lt.tm_min):
+            return ts
+        minuit = ts - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+        cible = minuit + debut * 60
+        ts = cible if cible > ts else cible + 86400
+    return ts
+
+
+def horaires_previsionnels(depart, ecarts, plage, nb, cout_envoi=sm.COUT_ENVOI):
+    """Horodatages previsionnels des `nb` envois, plage horaire comprise.
+
+    Rejoue ce que fera le worker — attendre l'ouverture de la plage, envoyer,
+    patienter — mais sur une horloge simulee. Sert a montrer dans la
+    simulation quand chaque message partira reellement : sur une campagne
+    etalee sur des jours, "577 destinataires" ne dit rien d'utile, "le dernier
+    part jeudi a 11h20" si."""
+    horaires, ts = [], depart
+    for i in range(nb):
+        ts = _prochaine_ouverture(ts, plage)
+        horaires.append(ts)
+        ts += cout_envoi + (ecarts[i] if i < len(ecarts) else 0.0)
+    return horaires
+
+
+def formate_horaires(horaires):
+    """Horaires en texte court : l'heure seule tant qu'on reste le meme jour,
+    la date des que la campagne deborde sur le lendemain."""
+    if not horaires:
+        return []
+    jour0 = time.localtime(horaires[0]).tm_yday
+    return [time.strftime("%H:%M" if time.localtime(t).tm_yday == jour0
+                          else "%d/%m %H:%M", time.localtime(t))
+            for t in horaires]
+
+
 def dans_plage(plage, maintenant=None):
     """La plage autorise-t-elle un envoi maintenant ? Gere le cas d'une plage
     qui passe minuit (22:00-06:00)."""
@@ -446,20 +488,27 @@ class Api:
             return {"error": str(e)}
 
         n = len(cfg["lots"])
+        destinataires = sum(len(lot) for lot in cfg["lots"])
         duree = cfg["duree"]
         ecart_moyen = (duree - n * sm.COUT_ENVOI) / max(n - 1, 1) if duree else 0.0
 
         avertissements = []
         quota = QUOTAS.get(cfg["sender"].rsplit("@", 1)[-1].lower())
         if quota:
+            # Le quota se compte en DESTINATAIRES, pas en messages : grouper
+            # 577 adresses en 12 envois n'en consomme pas 12 mais 577. Compter
+            # les lots ici laisserait passer sans un mot une campagne groupee
+            # tres au-dessus de la limite.
             jours = max(duree / 86400.0, 0.0)
-            par_jour = n / jours if jours >= 1 else n
+            par_jour = destinataires / jours if jours >= 1 else destinataires
             if par_jour > quota:
                 avertissements.append(
-                    f"{n} messages depassent le quota de {quota}/jour de ce "
-                    f"fournisseur" + (f" ({par_jour:.0f}/jour au rythme prevu)"
-                                       if jours >= 1 else "") +
-                    " — au-dela, les envois sont rejetes et le compte suspendu 24 h.")
+                    f"{destinataires} destinataires depassent le quota de "
+                    f"{quota}/jour de ce fournisseur" +
+                    (f" ({par_jour:.0f}/jour au rythme prevu)" if jours >= 1 else "") +
+                    " — le quota se compte par destinataire, meme groupes dans "
+                    "un seul message. Au-dela, les envois sont rejetes et le "
+                    "compte suspendu 24 h.")
         if not duree:
             avertissements.append(
                 "aucune duree de campagne : les messages partiront a la suite, "
@@ -480,7 +529,7 @@ class Api:
 
         return {
             "messages": n,
-            "destinataires": sum(len(lot) for lot in cfg["lots"]),
+            "destinataires": destinataires,
             "objets": len(cfg["subjects"]),
             "duree": duree,
             "ecartMoyen": ecart_moyen,
@@ -550,9 +599,22 @@ class Api:
             cle = premier.lower()
             corps = sm.personalize(corps, premier, cfg["genres"].get(cle),
                                    cfg["noms"].get(cle))
+        # Le calendrier est rejoue avec les memes fonctions que l'envoi reel
+        # (gaps + plage horaire), sur le nombre de LOTS et non de destinataires :
+        # en mode groupe, un lot part en un seul message et c'est lui qui est
+        # cadence. Sans ca, la simulation annoncerait un calendrier que l'envoi
+        # ne suivrait pas.
+        lots = cfg["lots"]
+        ecarts = sm.gaps(len(lots), cfg["duree"]) if cfg["duree"] else []
+        horaires = horaires_previsionnels(time.time(), ecarts, cfg["plage"],
+                                          len(lots))
         return {
             "host": cfg["host"], "port": cfg["port"],
-            "lots": [list(lot) for lot in cfg["lots"]],
+            "lots": [list(lot) for lot in lots],
+            "schedule": formate_horaires(horaires),
+            "fin": formate_horaires(horaires)[-1] if horaires else None,
+            "grouped": len(lots) != sum(len(l) for l in lots),
+            "destinataires": sum(len(l) for l in lots),
             "body": corps, "personalizedFor": premier if personnalise else None,
             "isHtml": cfg["is_html"], "missingGender": cfg["sans_genre"],
             "excluded": cfg["exclus"],

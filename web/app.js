@@ -360,9 +360,30 @@ async function dryRun() {
   // pour Envoyer.
   const res = await window.pywebview.api.dry_run(collect());
   if (res.error) { log(res.error, "line-err"); return; }
-  log(`[simulation] authentification vérifiée sur ${res.host}:${res.port} — ` +
-    `${res.isHtml ? "HTML" : "texte"}`, "line-ok");
-  res.lots.forEach((lot) => log(`  -> ${lot.join(", ")}`, "line-muted"));
+
+  // Deux faits distincts, sur deux lignes : accolés avec un tiret, le format
+  // du corps se lisait comme s'il qualifiait l'authentification.
+  log(`[simulation] authentification vérifiée sur ${res.host}:${res.port}`, "line-ok");
+  log(`  corps envoyé en ${res.isHtml ? "HTML" : "texte brut"}`, "line-muted");
+
+  const groupe = res.grouped;
+  log(`  ${res.lots.length} message${res.lots.length > 1 ? "s" : ""} pour ` +
+    `${res.destinataires} destinataire${res.destinataires > 1 ? "s" : ""}` +
+    (groupe ? ` (groupés — tous ceux d'un lot se voient en To)` : ""), "line-muted");
+
+  res.lots.forEach((lot, i) => {
+    const h = res.schedule && res.schedule[i] ? `${res.schedule[i]}  ` : "";
+    log(`  ${h}-> ${lot.join(", ")}`, "line-muted");
+  });
+  if (res.fin) log(`  dernier envoi prévu vers ${res.fin}`, "line-muted");
+  if (res.schedule && res.schedule.length > 1) {
+    // La simulation garde l'ordre saisi pour rester relisible d'un clic à
+    // l'autre, alors que l'envoi réel tire un ordre au hasard : les horaires
+    // sont donc justes, mais pas forcément en face de la bonne adresse.
+    log(`  (horaires indicatifs : l'ordre des destinataires est tiré au ` +
+      `hasard au moment de l'envoi)`, "line-muted");
+  }
+
   if (res.personalizedFor) {
     log(`  corps personnalisé pour ${res.personalizedFor}`, "line-muted");
   }
